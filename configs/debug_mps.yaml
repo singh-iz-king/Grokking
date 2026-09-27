@@ -1,0 +1,66 @@
+experiment:
+  name: modular_addition_p113_debug
+  seed: 0
+  modulus: 113
+  train_fraction: 0.3
+  epochs: 5
+
+data:
+  token_equals: 113
+  input_length: 3
+  split_method: shuffled_all_pairs_python_random
+
+model:
+  n_layers: 1
+  n_heads: 4
+  d_model: 128
+  d_head: 32
+  d_mlp: 512
+  activation: relu
+  normalization: null
+  positional_embeddings: learned
+  causal_attention: true
+  dropout: 0.0
+  tie_embeddings: false
+  initialization: nanda_manual_normal
+
+optimizer:
+  name: AdamW
+  learning_rate: 0.001
+  weight_decay: 1.0
+  beta1: 0.9
+  beta2: 0.98
+  epsilon: 1.0e-8
+  warmup_steps: 10
+  weight_decay_all_parameters: true
+
+training:
+  batch_size: full
+  loss: cross_entropy
+  loss_precision: float64
+  early_stopping_test_loss_below: null
+
+logging:
+  train_metrics_interval: 1
+  validation_interval: 1
+  progress_interval: 1
+  mechanistic_metrics_interval: 1
+  checkpoint_interval: 5
+  ablation_interval: 5
+
+mechanistic:
+  key_frequencies:
+    mode: fixed
+    paper_mainline: [14, 35, 41, 42, 52]
+    neuron_explained_fraction: 0.85
+  frequency_ablations: true
+  save_fourier_spectra: true
+
+device:
+  selection: auto
+  allow_cpu_fallback: true
+
+output:
+  root: results
+  checkpoint_root: checkpoints
+  save_plots: true
