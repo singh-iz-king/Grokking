@@ -4,7 +4,7 @@ import argparse
 
 from src.config import load_config
 from src.distributed_trainer import NODE_COUNT, train_distributed
-from src.plotting import plot_results
+from src.plotting import plot_node_metrics, plot_results
 
 
 def main() -> None:
@@ -36,7 +36,11 @@ def main() -> None:
     )
     if config["output"]["save_plots"]:
         figures = plot_results(run_dir)
-        print(f"Distributed run saved to {run_dir}; figures saved to {figures}")
+        node_figures = plot_node_metrics(run_dir)
+        print(
+            f"Distributed run saved to {run_dir}; figures saved to {figures} "
+            f"and per-node figures to {node_figures}"
+        )
     else:
         print(f"Distributed run saved to {run_dir}")
 

@@ -68,6 +68,12 @@ Use `--tau 0` for the synchronous control: all five nodes calculate gradients fr
 
 Distributed runs write ordinary train/test metrics for the updated global model at every global step to `metrics.jsonl` and `metrics.csv`. `node_metrics.jsonl` contains one record per node per step, with its sampled lag, source model version, and that source model's train/test metrics. Mechanistic source-model measures are attached at `mechanistic_metrics_interval`; the new global model's mechanistic measures and Fourier spectra are computed at the same cadence. Checkpoints also save the retained model history and staleness RNG state. The simulator uses five logical nodes in one process; it does not simulate network delays or launch separate workers.
 
+When `save_plots` is enabled, the distributed command also creates `figures/nodes/node_0/` through `node_4/`, with per-node train/test loss and accuracy, restricted/excluded metrics, weight/Gini progress, Fourier spectra, key-logit coefficients, individual-frequency ablations, and staleness plots. Mechanistic plots are sampled at the mechanistic logging cadence and describe the node's selected gradient-source model; x-axis values are global steps. To regenerate these node figures from an existing run:
+
+```bash
+python -m scripts.plot_node_metrics results/<distributed-run-name>
+```
+
 ## Outputs
 
 Runs are written under `results/` by default. A run directory contains:
@@ -77,7 +83,7 @@ Runs are written under `results/` by default. A run directory contains:
 - `metrics.csv`: tabular form of the same records (structured frequency/spectrum values are JSON-encoded).
 - `fourier_spectra.csv`: embedding and neuron-to-logit Fourier component norms at mechanistic-analysis epochs.
 - `final.pt`: final checkpoint; periodic checkpoints are under `checkpoints/`.
-- `figures/`: generated loss, accuracy, restricted/excluded, weight norm, Gini, Fourier-spectrum, and logit-coefficient plots.
+- `figures/`: generated global loss, accuracy, restricted/excluded, weight norm, Gini, Fourier-spectrum, and logit-coefficient plots. Distributed runs additionally contain `figures/nodes/node_<id>/` per-node figures.
 
 The fixed paper frequencies and the frequencies detected from each checkpoint are recorded separately. To use frequency discovery as the active restricted-loss definition, set `mechanistic.key_frequencies.mode: discover`; this changes the active frequency set over time and is therefore distinct from the paper-frequency curve.
 
@@ -102,7 +108,7 @@ For the restricted/excluded loss definitions, frequency-identification algorithm
 ```text
 configs/       Canonical p=113 and short debug YAML configurations
 docs/          Source notes and defensible mathematical metric definitions
-scripts/       Train, analyze checkpoints, and regenerate plots
+scripts/       Train, analyze checkpoints, and regenerate global/per-node plots
 src/           Dataset, model, Fourier analysis, progress measures, trainer, logging
 tests/         Dataset, architecture, Fourier, ablation, and training smoke tests
 results/       Run metrics and figures (generated)

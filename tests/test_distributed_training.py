@@ -3,6 +3,7 @@ import json
 import torch
 
 from src.distributed_trainer import train_distributed
+from src.plotting import plot_node_metrics
 from src.trainer import train
 
 
@@ -101,6 +102,19 @@ def test_positive_tau_warms_up_then_samples_valid_staleness(tmp_path, capsys) ->
     by_step = [row for row in node_rows if row["step"] == 6]
     assert len(by_step) == 5
     assert all("progress_measures" in row for row in by_step)
+    figures_dir = plot_node_metrics(run_dir)
+    for node in range(5):
+        node_figures = figures_dir / f"node_{node}"
+        assert (node_figures / "train_test_loss.png").is_file()
+        assert (node_figures / "restricted_excluded_loss.png").is_file()
+        assert (node_figures / "restricted_excluded_accuracy.png").is_file()
+        assert (node_figures / "weight_l2_norm.png").is_file()
+        assert (node_figures / "fourier_gini.png").is_file()
+        assert (node_figures / "embedding_fourier_norms.png").is_file()
+        assert (node_figures / "logit_map_fourier_norms.png").is_file()
+        assert (node_figures / "key_logit_coefficients.png").is_file()
+        assert (node_figures / "excluded_by_frequency_train_loss.png").is_file()
+        assert (node_figures / "staleness.png").is_file()
     checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
     state = checkpoint["distributed_state"]
     assert state["tau"] == 2
