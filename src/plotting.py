@@ -17,6 +17,13 @@ def _read_metrics(run_dir: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def _row_step(row: dict[str, Any]) -> int:
+    value = row.get("epoch", row.get("step"))
+    if value is None:
+        raise ValueError("metric record has neither epoch nor step")
+    return int(value)
+
+
 def _plot_series(
     rows: list[dict[str, Any]],
     keys: list[str],
@@ -30,7 +37,7 @@ def _plot_series(
     has_values = False
     for key in keys:
         points = [
-            (row["epoch"], row[key])
+            (_row_step(row), row[key])
             for row in rows
             if isinstance(row.get(key), (float, int))
         ]
@@ -92,7 +99,7 @@ def _plot_frequency_ablations(
         for frequency, values in ablations.items():
             if isinstance(values, dict) and metric in values:
                 series[str(frequency)].append(
-                    (int(row["epoch"]), float(values[metric]))
+                    (_row_step(row), float(values[metric]))
                 )
     if not series:
         return
@@ -171,7 +178,7 @@ def plot_results(run_dir: str | Path) -> Path:
         values = row.get("key_logit_coefficients")
         if isinstance(values, dict):
             for frequency, value in values.items():
-                coefficients[str(frequency)].append((int(row["epoch"]), float(value)))
+                coefficients[str(frequency)].append((_row_step(row), float(value)))
     fig, ax = plt.subplots(figsize=(9, 5))
     for frequency, points in coefficients.items():
         ax.plot([x for x, _ in points], [y for _, y in points], label=f"k={frequency}")

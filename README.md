@@ -54,6 +54,20 @@ Set `experiment.seed` to select a new data split and model initialization. The c
 
 At startup, the script prints a run summary with the selected device, data/split sizes, seed, architecture and parameter count, training duration and loss, optimizer settings, logging cadences, Fourier-key mode, runtime versions, and output/checkpoint paths. The YAML has independent `train_metrics_interval`, `validation_interval`, `progress_interval`, `mechanistic_metrics_interval`, `checkpoint_interval`, and `ablation_interval` values. The canonical run evaluates train/test metrics each epoch, prints a terminal progress line every 1,000 epochs, and computes progress measures every 100 epochs. Progress lines include elapsed and interval time, train/validation accuracy, and loss. Checkpoints are saved every 1,000 epochs to limit disk use, plus a final checkpoint; the complete metric curves do not depend on retaining every intermediate checkpoint.
 
+## Run the distributed staleness experiment
+
+The distributed simulator uses **five logical nodes** and the same p=113 model, dataset split, full-batch gradients, and canonical AdamW settings:
+
+```bash
+python -m scripts.train_distributed --config configs/modular_addition_p113.yaml --tau 5
+```
+
+The number of global updates comes from `experiment.epochs` in the YAML. Each global step samples one model version per node, computes five full-training-split gradients, averages them, and applies one AdamW update to the latest central model. For `tau > 0`, nodes use the current model synchronously until `tau` update-history steps exist; afterward, each node independently samples a lag uniformly from `1..tau`. The history keeps the current model and its `tau` predecessors.
+
+Use `--tau 0` for the synchronous control: all five nodes calculate gradients from the same current model. Their mean is equivalent to one centralized full-batch gradient, up to floating-point summation roundoff.
+
+Distributed runs write ordinary train/test metrics for the updated global model at every global step to `metrics.jsonl` and `metrics.csv`. `node_metrics.jsonl` contains one record per node per step, with its sampled lag, source model version, and that source model's train/test metrics. Mechanistic source-model measures are attached at `mechanistic_metrics_interval`; the new global model's mechanistic measures and Fourier spectra are computed at the same cadence. Checkpoints also save the retained model history and staleness RNG state. The simulator uses five logical nodes in one process; it does not simulate network delays or launch separate workers.
+
 ## Outputs
 
 Runs are written under `results/` by default. A run directory contains:

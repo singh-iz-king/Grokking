@@ -52,7 +52,11 @@ def main() -> None:
         include_ablation_metrics=True,
         frequency_mode=str(config["mechanistic"]["key_frequencies"]["mode"]),
     )
-    result = {"epoch": checkpoint["epoch"], **metrics}
+    result = {
+        "epoch": checkpoint.get("epoch"),
+        "step": checkpoint.get("step"),
+        **metrics,
+    }
     output = args.output or args.checkpoint.with_name("analysis.json")
     write_json(output, result)
     print(f"Checkpoint analysis written to {output} (device: {device})")
@@ -60,4 +64,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
