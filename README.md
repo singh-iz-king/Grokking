@@ -52,7 +52,9 @@ python -m scripts.train --config configs/modular_addition_p113.yaml
 
 Set `experiment.seed` to select a new data split and model initialization. The code seeds Python, NumPy, and PyTorch, records the selected device and environment, and saves the effective YAML configuration in each run directory.
 
-At startup, the script prints a run summary with the selected device, data/split sizes, seed, architecture and parameter count, training duration and loss, optimizer settings, logging cadences, Fourier-key mode, runtime versions, and output/checkpoint paths. The YAML has independent `train_metrics_interval`, `validation_interval`, `progress_interval`, `mechanistic_metrics_interval`, `checkpoint_interval`, and `ablation_interval` values. The canonical run evaluates train/test metrics each epoch, prints a terminal progress line every 1,000 epochs, and computes progress measures every 100 epochs. Progress lines include elapsed and interval time, train/validation accuracy, and loss. Checkpoints are saved every 1,000 epochs to limit disk use, plus a final checkpoint; the complete metric curves do not depend on retaining every intermediate checkpoint.
+At startup, the script prints a run summary with the selected device, data/split sizes, seed, architecture and parameter count, training duration and loss, optimizer settings, logging cadences, Fourier-key mode, runtime versions, and output/checkpoint paths. The YAML has independent `train_metrics_interval`, `validation_interval`, `progress_interval`, `mechanistic_metrics_interval`, `checkpoint_interval`, and `ablation_interval` values. The canonical run evaluates train/test metrics each epoch, prints a terminal progress line every 1,000 epochs, and computes progress measures every 100 epochs. Progress lines include elapsed and interval time, train/validation accuracy, and loss. Checkpoints are saved every 1,000 epochs plus the final checkpoint. The canonical command always starts a fresh run; loading/resuming from a checkpoint is not implemented.
+
+The canonical `metrics.jsonl`/`metrics.csv` are the **one-node baseline**. They contain one record per epoch, including ordinary train/test metrics and periodic mechanistic measures. This path is unchanged by the distributed experiment.
 
 ## Run the distributed staleness experiment
 
@@ -64,28 +66,41 @@ python -m scripts.train_distributed --config configs/modular_addition_p113.yaml 
 
 The number of global updates comes from `experiment.epochs` in the YAML. Each global step samples one model version per node, computes five full-training-split gradients, averages them, and applies one AdamW update to the latest central model. For `tau > 0`, nodes use the current model synchronously until `tau` update-history steps exist; afterward, each node independently samples a lag uniformly from `1..tau`. The history keeps the current model and its `tau` predecessors.
 
-Use `--tau 0` for the synchronous control: all five nodes calculate gradients from the same current model. Their mean is equivalent to one centralized full-batch gradient, up to floating-point summation roundoff.
+Use `--tau 0` for the synchronous five-node control: all five nodes calculate gradients from the same current model. Their mean is equivalent to one centralized full-batch gradient, up to floating-point summation roundoff. This is a separate run from the canonical one-node command above.
 
-Distributed runs write ordinary train/test metrics for the updated global model at every global step to `metrics.jsonl` and `metrics.csv`. `node_metrics.jsonl` contains one record per node per step, with its sampled lag, source model version, and that source model's train/test metrics. Mechanistic source-model measures are attached at `mechanistic_metrics_interval`; the new global model's mechanistic measures and Fourier spectra are computed at the same cadence. Checkpoints also save the retained model history and staleness RNG state. The simulator uses five logical nodes in one process; it does not simulate network delays or launch separate workers.
+To compare learning rates at a fixed τ, add `--step-size-sweep`:
 
-When `save_plots` is enabled, the distributed command also creates `figures/nodes/node_0/` through `node_4/`, with per-node train/test loss and accuracy, restricted/excluded metrics, weight/Gini progress, Fourier spectra, key-logit coefficients, individual-frequency ablations, and staleness plots. Mechanistic plots are sampled at the mechanistic logging cadence and describe the node's selected gradient-source model; x-axis values are global steps. To regenerate these node figures from an existing run:
+```bash
+python -m scripts.train_distributed --config configs/modular_addition_p113.yaml --tau 5 --step-size-sweep
+```
+
+This runs three fresh experiments sequentially at the YAML learning rate, `0.1×` that rate, and `0.01×` that rate. The seed, split, architecture, τ, and all other training settings are held constant. Each run's directory name includes its learning-rate factor and actual rate (for example `lr_factor_0p1_lr_0p0001`), and its effective `config.yaml`, metrics, checkpoints, and figures are stored separately as usual. The terminal prints each factor/rate before starting and summarizes all output paths at the end. If `--run-dir` is supplied, it is used as a parent directory for three factor-tagged run directories; it must not already contain those run directories.
+
+Distributed runs write ordinary train/test metrics for the updated global model at every global step to `metrics.jsonl` and `metrics.csv`. These records identify the global step and include all five sampled lags and source model versions. `node_metrics.jsonl` contains one record per node per step, with its sampled lag, source model version, and that source model's train/test metrics. Thus node-level curves are per-node views of selected gradient-source snapshots, not separate persistent node models. Mechanistic source-snapshot measures are attached at `mechanistic_metrics_interval`; the updated global model's mechanistic measures and Fourier spectra are also computed at that cadence. Fixed paper keys and keys discovered for each analyzed model are recorded separately. Restricted loss/accuracy is reported for both key sets at the mechanistic cadence; excluded loss/accuracy for both sets and individual-frequency ablations are computed at the ablation cadence. Checkpoints also save the retained model history and staleness RNG state. The simulator uses five logical nodes in one process; it does not simulate network delays or launch separate workers. Like the canonical command, it always starts a fresh run rather than resuming from a checkpoint.
+
+When `save_plots` is enabled, the distributed command also creates `figures/nodes/node_0/` through `node_4/`, with per-node train/test loss and accuracy, separate restricted/excluded plots comparing fixed paper frequencies with frequencies discovered in that source model, weight/Gini progress, Fourier spectra, key-logit coefficients, individual-frequency ablations, and staleness plots. Mechanistic plots are sampled at the mechanistic/ablation logging cadences and describe the node's selected gradient-source model; x-axis values are global steps. To regenerate these node figures from an existing run:
 
 ```bash
 python -m scripts.plot_node_metrics results/<distributed-run-name>
 ```
+
+The `*_keys.png` plots deliberately separate fixed paper frequencies (`14, 35, 41, 42, 52`) from frequencies discovered in the current model. This matters in distributed runs: if the model learns a different Fourier solution, accuracy can remain high after removing the paper frequencies while restriction to those paper frequencies remains weak. Check `detected_key_frequencies`, and compare the `*_fixed` and `*_discovered` metrics, before interpreting that pattern.
+
+For runs created before fixed-versus-discovered metric fields were added, plot regeneration can only show values that were actually saved. It cannot reconstruct absent discovered-key accuracy/exclusion values without the corresponding model checkpoints.
 
 ## Outputs
 
 Runs are written under `results/` by default. A run directory contains:
 
 - `config.yaml`, `environment.json`: effective configuration, seed, device, package/runtime details, and source commit when available.
-- `metrics.jsonl`: complete, machine-readable per-epoch metrics and periodic mechanistic measures.
-- `metrics.csv`: tabular form of the same records (structured frequency/spectrum values are JSON-encoded).
-- `fourier_spectra.csv`: embedding and neuron-to-logit Fourier component norms at mechanistic-analysis epochs.
-- `final.pt`: final checkpoint; periodic checkpoints are under `checkpoints/`.
-- `figures/`: generated global loss, accuracy, restricted/excluded, weight norm, Gini, Fourier-spectrum, and logit-coefficient plots. Distributed runs additionally contain `figures/nodes/node_<id>/` per-node figures.
+- `metrics.jsonl`: canonical run records per epoch; distributed run records per global optimizer step, with periodic mechanistic measures and distributed lag/source-version details.
+- `metrics.csv`: tabular form of those global records (structured frequency/spectrum values are JSON-encoded).
+- `node_metrics.jsonl` (distributed only): five records per global step, identifying node, source model version, staleness, train/test metrics, and periodic source-model progress measures.
+- `fourier_spectra.csv`: global-model embedding and neuron-to-logit Fourier component norms at mechanistic-analysis steps.
+- `final.pt`: final checkpoint; periodic checkpoints are under `checkpoints/<run-name>/`. Distributed checkpoints additionally contain retained staleness history and RNG state.
+- `figures/`: generated global loss, accuracy, fixed/discovered restricted/excluded curves, weight norm, Gini, Fourier-spectrum, and logit-coefficient plots. Distributed runs additionally contain `figures/nodes/node_<id>/` per-node figures.
 
-The fixed paper frequencies and the frequencies detected from each checkpoint are recorded separately. To use frequency discovery as the active restricted-loss definition, set `mechanistic.key_frequencies.mode: discover`; this changes the active frequency set over time and is therefore distinct from the paper-frequency curve.
+The fixed paper frequencies and the frequencies detected from each analyzed model are recorded separately. `mechanistic.key_frequencies.mode` selects which set is used for the unqualified `restricted_*` metric: `fixed` (canonical default) uses the YAML paper frequencies; `discover` uses that model's detected keys. Explicit `*_fixed` and `*_discovered` fields are logged separately so the two analyses can be compared regardless of the active mode. Excluded-by-key-set variants require ablation metrics to be enabled and are calculated at `ablation_interval`.
 
 ## Analyze or plot an existing run
 

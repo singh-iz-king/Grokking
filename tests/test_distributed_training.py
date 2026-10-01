@@ -4,6 +4,7 @@ import torch
 
 from src.distributed_trainer import train_distributed
 from src.plotting import plot_node_metrics
+from scripts.train_distributed import run_learning_rate_sweep
 from src.trainer import train
 
 
@@ -106,8 +107,10 @@ def test_positive_tau_warms_up_then_samples_valid_staleness(tmp_path, capsys) ->
     for node in range(5):
         node_figures = figures_dir / f"node_{node}"
         assert (node_figures / "train_test_loss.png").is_file()
-        assert (node_figures / "restricted_excluded_loss.png").is_file()
-        assert (node_figures / "restricted_excluded_accuracy.png").is_file()
+        assert (node_figures / "restricted_loss_keys.png").is_file()
+        assert (node_figures / "excluded_loss_keys.png").is_file()
+        assert (node_figures / "restricted_accuracy_keys.png").is_file()
+        assert (node_figures / "excluded_accuracy_keys.png").is_file()
         assert (node_figures / "weight_l2_norm.png").is_file()
         assert (node_figures / "fourier_gini.png").is_file()
         assert (node_figures / "embedding_fourier_norms.png").is_file()
@@ -120,3 +123,34 @@ def test_positive_tau_warms_up_then_samples_valid_staleness(tmp_path, capsys) ->
     assert state["tau"] == 2
     assert state["nodes"] == 5
     assert len(state["history"]) == 3
+
+
+def test_learning_rate_sweep_runs_three_tagged_experiments(tmp_path, capsys) -> None:
+    config = _config(tmp_path, epochs=1)
+    config["logging"]["mechanistic_metrics_interval"] = 2
+    config["logging"]["ablation_interval"] = 2
+    config["output"]["save_plots"] = False
+    results = run_learning_rate_sweep(
+        config,
+        tau=0,
+        run_dir=tmp_path / "sweep",
+    )
+    capsys.readouterr()
+
+    assert [factor for factor, _, _ in results] == [1.0, 0.1, 0.01]
+    assert [learning_rate for _, learning_rate, _ in results] == [
+        0.001,
+        0.0001,
+        0.00001,
+    ]
+    assert len({path for _, _, path in results}) == 3
+    for factor, learning_rate, run_dir in results:
+        tag = run_dir.name
+        assert f"lr_factor_{factor:g}".replace(".", "p") in tag
+        assert run_dir.joinpath("final.pt").is_file()
+        saved_config = __import__("yaml").safe_load(
+            run_dir.joinpath("config.yaml").read_text()
+        )
+        assert saved_config["optimizer"]["learning_rate"] == learning_rate
+        checkpoint_dir = tmp_path / "checkpoints" / tag
+        assert (checkpoint_dir / "final.pt").is_file()

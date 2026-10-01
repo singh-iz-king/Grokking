@@ -19,8 +19,11 @@ def test_progress_measures_are_deterministic_for_fixed_checkpoint() -> None:
     )
     assert first["restricted_loss"] == second["restricted_loss"]
     assert first["excluded_loss"] == second["excluded_loss"]
+    assert first["restricted_test_accuracy_discovered"] == second["restricted_test_accuracy_discovered"]
+    assert first["excluded_test_accuracy_discovered"] == second["excluded_test_accuracy_discovered"]
+    assert "restricted_test_accuracy_fixed" in first
+    assert "excluded_test_accuracy_fixed" in first
     assert first["embedding_fourier_gini"] == second["embedding_fourier_gini"]
     assert first["fixed_key_frequencies"] == [2]
     assert first["excluded_loss_by_frequency"].keys() == {"2"}
     assert len(spectra) == 2 * 7
-

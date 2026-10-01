@@ -24,6 +24,29 @@ def _row_step(row: dict[str, Any]) -> int:
     return int(value)
 
 
+def _add_legacy_fixed_frequency_aliases(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    frequency_mode = normalized.get("frequency_mode", "fixed")
+    if frequency_mode == "fixed":
+        for field in (
+            "restricted_loss",
+            "restricted_train_loss",
+            "restricted_test_loss",
+            "restricted_train_accuracy",
+            "restricted_test_accuracy",
+        ):
+            normalized.setdefault(f"{field}_fixed", normalized.get(field))
+    for field in (
+        "excluded_loss",
+        "excluded_train_loss",
+        "excluded_test_loss",
+        "excluded_train_accuracy",
+        "excluded_test_accuracy",
+    ):
+        normalized.setdefault(f"{field}_fixed", normalized.get(field))
+    return normalized
+
+
 def _plot_series(
     rows: list[dict[str, Any]],
     keys: list[str],
@@ -130,7 +153,7 @@ def _plot_frequency_ablations(
 
 def plot_results(run_dir: str | Path) -> Path:
     run_dir = Path(run_dir)
-    rows = _read_metrics(run_dir)
+    rows = [_add_legacy_fixed_frequency_aliases(row) for row in _read_metrics(run_dir)]
     if not rows:
         raise ValueError(f"No metric records found in {run_dir}")
     figures_dir = run_dir / "figures"
@@ -141,19 +164,44 @@ def plot_results(run_dir: str | Path) -> Path:
                  "Accuracy", figures_dir / "accuracy.png")
     _plot_series(
         rows,
-        ["restricted_loss", "excluded_loss", "train_loss", "test_loss"],
-        "Restricted and excluded loss",
+        [
+            "restricted_loss_fixed", "restricted_loss_discovered",
+            "train_loss", "test_loss",
+        ],
+        "Restricted loss: fixed vs. discovered keys",
         "Cross-entropy loss",
-        figures_dir / "restricted_excluded_loss.png",
+        figures_dir / "restricted_loss_keys.png",
         log_y=True,
     )
     _plot_series(
         rows,
-        ["restricted_train_accuracy", "restricted_test_accuracy",
-         "excluded_train_accuracy", "excluded_test_accuracy"],
-        "Restricted and excluded accuracy",
+        ["excluded_loss_fixed", "excluded_loss_discovered"],
+        "Excluded loss: fixed vs. discovered keys",
+        "Cross-entropy loss",
+        figures_dir / "excluded_loss_keys.png",
+        log_y=True,
+    )
+    _plot_series(
+        rows,
+        [
+            "restricted_train_accuracy_fixed", "restricted_test_accuracy_fixed",
+            "restricted_train_accuracy_discovered",
+            "restricted_test_accuracy_discovered",
+        ],
+        "Restricted accuracy: fixed vs. discovered keys",
         "Accuracy",
-        figures_dir / "restricted_excluded_accuracy.png",
+        figures_dir / "restricted_accuracy_keys.png",
+    )
+    _plot_series(
+        rows,
+        [
+            "excluded_train_accuracy_fixed", "excluded_test_accuracy_fixed",
+            "excluded_train_accuracy_discovered",
+            "excluded_test_accuracy_discovered",
+        ],
+        "Excluded accuracy: fixed vs. discovered keys",
+        "Accuracy",
+        figures_dir / "excluded_accuracy_keys.png",
     )
     _plot_frequency_ablations(
         rows, figures_dir, "train_loss", "train", log_y=True
@@ -330,10 +378,18 @@ def plot_node_metrics(run_dir: str | Path) -> Path:
     output_root.mkdir(parents=True, exist_ok=True)
     nodes = sorted({int(row["node"]) for row in rows})
     for node in nodes:
-        node_rows = sorted(
-            (row for row in rows if int(row["node"]) == node),
-            key=lambda row: int(row["step"]),
-        )
+        node_rows = []
+        for row in rows:
+            if int(row["node"]) != node:
+                continue
+            normalized = dict(row)
+            measures = normalized.get("progress_measures")
+            if isinstance(measures, dict):
+                normalized["progress_measures"] = _add_legacy_fixed_frequency_aliases(
+                    measures
+                )
+            node_rows.append(normalized)
+        node_rows.sort(key=lambda row: int(row["step"]))
         figures_dir = output_root / f"node_{node}"
         figures_dir.mkdir(parents=True, exist_ok=True)
         prefix = f"Node {node}: selected gradient-source model"
@@ -367,18 +423,44 @@ def plot_node_metrics(run_dir: str | Path) -> Path:
 
         scalar_specs = (
             (
-                "restricted_excluded_loss.png",
-                ("restricted_loss", "excluded_loss", "restricted_train_loss",
-                 "restricted_test_loss"),
-                "Restricted and excluded loss",
+                "restricted_loss_keys.png",
+                (
+                    "restricted_loss_fixed", "restricted_loss_discovered",
+                    "restricted_train_loss_fixed",
+                    "restricted_train_loss_discovered",
+                ),
+                "Restricted loss: fixed vs. discovered keys",
                 "Cross-entropy loss",
                 True,
             ),
             (
-                "restricted_excluded_accuracy.png",
-                ("restricted_train_accuracy", "restricted_test_accuracy",
-                 "excluded_train_accuracy", "excluded_test_accuracy"),
-                "Restricted and excluded accuracy",
+                "excluded_loss_keys.png",
+                ("excluded_loss_fixed", "excluded_loss_discovered"),
+                "Excluded loss: fixed vs. discovered keys",
+                "Cross-entropy loss",
+                True,
+            ),
+            (
+                "restricted_accuracy_keys.png",
+                (
+                    "restricted_train_accuracy_fixed",
+                    "restricted_test_accuracy_fixed",
+                    "restricted_train_accuracy_discovered",
+                    "restricted_test_accuracy_discovered",
+                ),
+                "Restricted accuracy: fixed vs. discovered keys",
+                "Accuracy",
+                False,
+            ),
+            (
+                "excluded_accuracy_keys.png",
+                (
+                    "excluded_train_accuracy_fixed",
+                    "excluded_test_accuracy_fixed",
+                    "excluded_train_accuracy_discovered",
+                    "excluded_test_accuracy_discovered",
+                ),
+                "Excluded accuracy: fixed vs. discovered keys",
                 "Accuracy",
                 False,
             ),

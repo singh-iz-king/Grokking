@@ -83,8 +83,29 @@ def calculate_progress_measures(
     restricted_active = restricted_fixed if frequency_mode == "fixed" else restricted_discovered
 
     per_frequency: dict[str, dict[str, float]] = {}
+
+    def excluded_summary(frequencies: list[int]) -> dict[str, float]:
+        ablated_logits = logits.clone()
+        for frequency in frequencies:
+            ablated_logits -= logits - exclude_frequency(logits, p, frequency)
+        train_loss, train_accuracy = _split_loss_accuracy(
+            ablated_logits, labels, data.train_indices
+        )
+        test_loss, test_accuracy = _split_loss_accuracy(
+            ablated_logits, labels, data.test_indices
+        )
+        return {
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy,
+            "test_loss": test_loss,
+            "test_accuracy": test_accuracy,
+        }
+
+    excluded_fixed: dict[str, float] | None = None
+    excluded_discovered: dict[str, float] | None = None
     if include_ablation_metrics:
-        all_excluded = logits.clone()
+        excluded_fixed = excluded_summary(fixed)
+        excluded_discovered = excluded_summary(detected)
         for frequency in fixed:
             ablated = exclude_frequency(logits, p, frequency)
             train_loss, train_accuracy = _split_loss_accuracy(
@@ -99,13 +120,6 @@ def calculate_progress_measures(
                 "test_loss": test_loss,
                 "test_accuracy": test_accuracy,
             }
-            all_excluded -= logits - ablated
-        excluded_train_loss, excluded_train_accuracy = _split_loss_accuracy(
-            all_excluded, labels, data.train_indices
-        )
-        excluded_test_loss, excluded_test_accuracy = _split_loss_accuracy(
-            all_excluded, labels, data.test_indices
-        )
 
     embedding = model.W_E[:, :p].detach().cpu().T.to(torch.float64)
     logit_map = neuron_to_logit_map(model).detach().cpu().to(torch.float64)
@@ -124,9 +138,13 @@ def calculate_progress_measures(
         "restricted_loss_fixed": restricted_fixed["all_loss"],
         "restricted_train_loss_fixed": restricted_fixed["train_loss"],
         "restricted_test_loss_fixed": restricted_fixed["test_loss"],
+        "restricted_train_accuracy_fixed": restricted_fixed["train_accuracy"],
+        "restricted_test_accuracy_fixed": restricted_fixed["test_accuracy"],
         "restricted_loss_discovered": restricted_discovered["all_loss"],
         "restricted_train_loss_discovered": restricted_discovered["train_loss"],
         "restricted_test_loss_discovered": restricted_discovered["test_loss"],
+        "restricted_train_accuracy_discovered": restricted_discovered["train_accuracy"],
+        "restricted_test_accuracy_discovered": restricted_discovered["test_accuracy"],
         "frequency_mode": frequency_mode,
         "fixed_key_frequencies": fixed,
         "detected_key_frequencies": detected,
@@ -160,12 +178,23 @@ def calculate_progress_measures(
                 "squared_norm": squared,
             })
     if include_ablation_metrics:
+        assert excluded_fixed is not None and excluded_discovered is not None
         metrics.update({
-            "excluded_loss": excluded_train_loss,
-            "excluded_train_loss": excluded_train_loss,
-            "excluded_test_loss": excluded_test_loss,
-            "excluded_train_accuracy": excluded_train_accuracy,
-            "excluded_test_accuracy": excluded_test_accuracy,
+            "excluded_loss": excluded_fixed["train_loss"],
+            "excluded_train_loss": excluded_fixed["train_loss"],
+            "excluded_test_loss": excluded_fixed["test_loss"],
+            "excluded_train_accuracy": excluded_fixed["train_accuracy"],
+            "excluded_test_accuracy": excluded_fixed["test_accuracy"],
+            "excluded_loss_fixed": excluded_fixed["train_loss"],
+            "excluded_train_loss_fixed": excluded_fixed["train_loss"],
+            "excluded_test_loss_fixed": excluded_fixed["test_loss"],
+            "excluded_train_accuracy_fixed": excluded_fixed["train_accuracy"],
+            "excluded_test_accuracy_fixed": excluded_fixed["test_accuracy"],
+            "excluded_loss_discovered": excluded_discovered["train_loss"],
+            "excluded_train_loss_discovered": excluded_discovered["train_loss"],
+            "excluded_test_loss_discovered": excluded_discovered["test_loss"],
+            "excluded_train_accuracy_discovered": excluded_discovered["train_accuracy"],
+            "excluded_test_accuracy_discovered": excluded_discovered["test_accuracy"],
             "excluded_loss_by_frequency": per_frequency,
         })
     if was_training:
