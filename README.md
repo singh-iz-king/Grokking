@@ -68,13 +68,26 @@ The number of global updates comes from `experiment.epochs` in the YAML. Each gl
 
 Use `--tau 0` for the synchronous five-node control: all five nodes calculate gradients from the same current model. Their mean is equivalent to one centralized full-batch gradient, up to floating-point summation roundoff. This is a separate run from the canonical one-node command above.
 
+### Mixed zero-delay and fixed-delay nodes
+
+To assign the first `N` nodes zero delay and the remaining nodes exactly `tau` global updates of delay, use the explicit mixed fixed-delay mode:
+
+```bash
+python -m scripts.train_distributed --config configs/modular_addition_p113.yaml \
+  --fixed-delay 5 --zero-delay-nodes 2
+```
+
+This assigns nodes `[0, 1]` to lag 0 and nodes `[2, 3, 4]` to lag 5. As in the uniform-staleness mode, all nodes use the current model during startup until the required five-version history exists; afterward the assignments are deterministic and fixed. `--zero-delay-nodes 0` makes all five nodes fixed-delay nodes, while `--zero-delay-nodes 5` makes all nodes current-model nodes. A fixed delay of 0 is synchronous for all nodes. These options must be provided together and cannot be combined with `--tau`; the existing `--tau` mode remains independent per-node uniform random staleness.
+
+The fixed-delay mode also supports `--step-size-sweep`. Its run directories identify the staleness mode, delay, zero-delay node count, and learning-rate factor/rate.
+
 To compare learning rates at a fixed τ, add `--step-size-sweep`:
 
 ```bash
 python -m scripts.train_distributed --config configs/modular_addition_p113.yaml --tau 5 --step-size-sweep
 ```
 
-This runs three fresh experiments sequentially at the YAML learning rate, `0.1×` that rate, and `0.01×` that rate. The seed, split, architecture, τ, and all other training settings are held constant. Each run's directory name includes its learning-rate factor and actual rate (for example `lr_factor_0p1_lr_0p0001`), and its effective `config.yaml`, metrics, checkpoints, and figures are stored separately as usual. The terminal prints each factor/rate before starting and summarizes all output paths at the end. If `--run-dir` is supplied, it is used as a parent directory for three factor-tagged run directories; it must not already contain those run directories.
+This runs three fresh experiments sequentially at the YAML learning rate, `0.1×` that rate, and `0.01×` that rate. The seed, split, architecture, delay settings, and all other training settings are held constant. Each run's directory name includes its staleness mode/parameters and learning-rate factor/rate (for example `uniform_tau_5_lr_factor_0p1_lr_0p0001`), and its effective `config.yaml`, metrics, checkpoints, and figures are stored separately as usual. The terminal prints each factor/rate before starting and summarizes all output paths at the end. If `--run-dir` is supplied, it is used as a parent directory for three tagged run directories; it must not already contain those run directories.
 
 Distributed runs write ordinary train/test metrics for the updated global model at every global step to `metrics.jsonl` and `metrics.csv`. These records identify the global step and include all five sampled lags and source model versions. `node_metrics.jsonl` contains one record per node per step, with its sampled lag, source model version, and that source model's train/test metrics. Thus node-level curves are per-node views of selected gradient-source snapshots, not separate persistent node models. Mechanistic source-snapshot measures are attached at `mechanistic_metrics_interval`; the updated global model's mechanistic measures and Fourier spectra are also computed at that cadence. Fixed paper keys and keys discovered for each analyzed model are recorded separately. Restricted loss/accuracy is reported for both key sets at the mechanistic cadence; excluded loss/accuracy for both sets and individual-frequency ablations are computed at the ablation cadence. Checkpoints also save the retained model history and staleness RNG state. The simulator uses five logical nodes in one process; it does not simulate network delays or launch separate workers. Like the canonical command, it always starts a fresh run rather than resuming from a checkpoint.
 

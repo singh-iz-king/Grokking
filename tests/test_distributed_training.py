@@ -125,6 +125,66 @@ def test_positive_tau_warms_up_then_samples_valid_staleness(tmp_path, capsys) ->
     assert len(state["history"]) == 3
 
 
+def test_mixed_fixed_delay_keeps_first_n_nodes_fresh(tmp_path, capsys) -> None:
+    config = _config(tmp_path, epochs=5, mechanistic_interval=5)
+    run_dir = train_distributed(
+        config,
+        tau=2,
+        staleness_mode="mixed_fixed",
+        zero_delay_nodes=2,
+        run_dir=tmp_path / "mixed_delay",
+    )
+    output = capsys.readouterr().out
+    assert "zero-delay nodes [0, 1] use lag 0" in output
+    assert "delayed nodes [2, 3, 4] use fixed lag 2" in output
+
+    rows = _read_jsonl(run_dir / "metrics.jsonl")
+    assert rows[1]["staleness"] == [0] * 5
+    assert rows[2]["staleness"] == [0] * 5
+    assert rows[3]["staleness"] == [0, 0, 2, 2, 2]
+    assert rows[3]["node_source_versions"] == [2, 2, 0, 0, 0]
+    assert rows[4]["staleness"] == [0, 0, 2, 2, 2]
+
+    node_rows = _read_jsonl(run_dir / "node_metrics.jsonl")
+    final_step = [row for row in node_rows if row["step"] == 5]
+    assert [row["staleness"] for row in final_step] == [0, 0, 2, 2, 2]
+    assert [row["source_model_version"] for row in final_step] == [4, 4, 2, 2, 2]
+    checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
+    state = checkpoint["distributed_state"]
+    assert state["tau"] == 2
+    assert state["staleness_mode"] == "mixed_fixed"
+    assert state["zero_delay_nodes"] == 2
+    assert state["zero_delay_node_ids"] == [0, 1]
+    assert state["delayed_node_ids"] == [2, 3, 4]
+
+
+def test_mixed_fixed_delay_all_zero_delay_and_invalid_count(tmp_path, capsys) -> None:
+    config = _config(tmp_path, epochs=4, mechanistic_interval=5)
+    run_dir = train_distributed(
+        config,
+        tau=1,
+        staleness_mode="mixed_fixed",
+        zero_delay_nodes=5,
+        run_dir=tmp_path / "all_fresh",
+    )
+    capsys.readouterr()
+    rows = _read_jsonl(run_dir / "metrics.jsonl")
+    assert all(row["staleness"] == [0] * 5 for row in rows)
+
+    try:
+        train_distributed(
+            config,
+            tau=1,
+            staleness_mode="mixed_fixed",
+            zero_delay_nodes=6,
+            run_dir=tmp_path / "invalid_count",
+        )
+    except ValueError as error:
+        assert "zero_delay_nodes must be between 0 and 5" in str(error)
+    else:
+        raise AssertionError("out-of-range zero_delay_nodes should fail")
+
+
 def test_learning_rate_sweep_runs_three_tagged_experiments(tmp_path, capsys) -> None:
     config = _config(tmp_path, epochs=1)
     config["logging"]["mechanistic_metrics_interval"] = 2
@@ -154,3 +214,28 @@ def test_learning_rate_sweep_runs_three_tagged_experiments(tmp_path, capsys) -> 
         assert saved_config["optimizer"]["learning_rate"] == learning_rate
         checkpoint_dir = tmp_path / "checkpoints" / tag
         assert (checkpoint_dir / "final.pt").is_file()
+
+
+def test_learning_rate_sweep_supports_mixed_fixed_delay(tmp_path, capsys) -> None:
+    config = _config(tmp_path, epochs=1, mechanistic_interval=2)
+    config["logging"]["ablation_interval"] = 2
+    config["output"]["save_plots"] = False
+    results = run_learning_rate_sweep(
+        config,
+        tau=2,
+        staleness_mode="mixed_fixed",
+        zero_delay_nodes=1,
+        run_dir=tmp_path / "mixed_sweep",
+    )
+    capsys.readouterr()
+
+    for _, _, run_dir in results:
+        assert "mixed_fixed_tau_2_zero_delay_nodes_1" in run_dir.name
+        assert "lr_factor_" in run_dir.name
+        saved_config = __import__("yaml").safe_load(
+            run_dir.joinpath("config.yaml").read_text()
+        )
+        assert saved_config["distributed"]["staleness_mode"] == "mixed_fixed"
+        assert saved_config["distributed"]["zero_delay_nodes"] == 1
+        checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
+        assert checkpoint["distributed_state"]["staleness_mode"] == "mixed_fixed"

@@ -59,6 +59,10 @@ def _save_distributed_checkpoint(
             "distributed_state": {
                 "nodes": NODE_COUNT,
                 "tau": config["distributed"]["tau"],
+                "staleness_mode": config["distributed"]["staleness_mode"],
+                "zero_delay_nodes": config["distributed"]["zero_delay_nodes"],
+                "zero_delay_node_ids": config["distributed"]["zero_delay_node_ids"],
+                "delayed_node_ids": config["distributed"]["delayed_node_ids"],
                 "history": [
                     {"version": version, "state_dict": state}
                     for version, state in history
@@ -82,6 +86,8 @@ def train_distributed(
     tau: int = 5,
     nodes: int = NODE_COUNT,
     run_dir: str | Path | None = None,
+    staleness_mode: str = "uniform",
+    zero_delay_nodes: int | None = None,
 ) -> Path:
     """Simulate async centralized gradient aggregation with node-local staleness.
 
@@ -94,6 +100,13 @@ def train_distributed(
         raise ValueError(f"this experiment is defined for exactly {NODE_COUNT} nodes")
     if tau < 0:
         raise ValueError("tau must be nonnegative")
+    if staleness_mode not in {"uniform", "mixed_fixed"}:
+        raise ValueError(f"unsupported staleness mode: {staleness_mode}")
+    if staleness_mode == "mixed_fixed":
+        if zero_delay_nodes is None or not 0 <= zero_delay_nodes <= nodes:
+            raise ValueError(f"zero_delay_nodes must be between 0 and {nodes}")
+    elif zero_delay_nodes is not None:
+        raise ValueError("zero_delay_nodes is only valid with mixed_fixed staleness")
 
     seed = int(config["experiment"]["seed"])
     seed_everything(seed)
@@ -106,13 +119,31 @@ def train_distributed(
         "enabled": True,
         "nodes": nodes,
         "tau": tau,
+        "staleness_mode": staleness_mode,
+        "zero_delay_nodes": zero_delay_nodes,
+        "zero_delay_node_ids": (
+            list(range(zero_delay_nodes))
+            if staleness_mode == "mixed_fixed" and zero_delay_nodes is not None
+            else []
+        ),
+        "delayed_node_ids": (
+            list(range(zero_delay_nodes, nodes))
+            if staleness_mode == "mixed_fixed" and zero_delay_nodes is not None
+            else list(range(nodes))
+        ),
         "aggregation": "mean_of_full_batch_node_gradients",
         "optimizer_semantics": "canonical_adamw_applied_once_per_global_step",
         "startup": "synchronous_until_tau_history_steps_exist",
         "node_metrics": "selected_gradient_source_model",
     }
     experiment = dict(config["experiment"])
-    experiment["name"] = f"{experiment['name']}_distributed_async_tau{tau}"
+    if staleness_mode == "mixed_fixed":
+        experiment["name"] = (
+            f"{experiment['name']}_distributed_mixed_fixed_tau{tau}"
+            f"_zero_delay_nodes{zero_delay_nodes}"
+        )
+    else:
+        experiment["name"] = f"{experiment['name']}_distributed_async_tau{tau}"
     effective_config["experiment"] = experiment
 
     if run_dir is not None:
@@ -147,6 +178,8 @@ def train_distributed(
         "total_examples": int(data.all_inputs.shape[0]),
         "distributed_nodes": nodes,
         "tau": tau,
+        "staleness_mode": staleness_mode,
+        "zero_delay_nodes": zero_delay_nodes,
     })
     write_json(output_dir / "environment.json", environment)
 
@@ -169,15 +202,27 @@ def train_distributed(
     )
     print(
         f"Distributed simulation: {nodes} nodes | tau={tau} | "
-        "full-batch gradients | mean aggregation | canonical AdamW",
+        f"staleness mode={staleness_mode} | full-batch gradients | "
+        "mean aggregation | canonical AdamW",
         flush=True,
     )
     if tau > 0:
-        print(
-            f"Staleness startup: synchronous through global step {tau}; "
-            f"then each node samples lag uniformly from 1..{tau}.",
-            flush=True,
-        )
+        if staleness_mode == "uniform":
+            print(
+                f"Staleness startup: synchronous through global step {tau}; "
+                f"then each node samples lag uniformly from 1..{tau}.",
+                flush=True,
+            )
+        else:
+            assert zero_delay_nodes is not None
+            zero_ids = list(range(zero_delay_nodes))
+            delayed_ids = list(range(zero_delay_nodes, nodes))
+            print(
+                f"Staleness startup: synchronous through global step {tau}; "
+                f"then zero-delay nodes {zero_ids} use lag 0 and "
+                f"delayed nodes {delayed_ids} use fixed lag {tau}.",
+                flush=True,
+            )
 
     total_steps = int(config["experiment"]["epochs"])
     logging = config["logging"]
@@ -214,6 +259,8 @@ def train_distributed(
                 "node_source_versions": [0] * nodes,
                 "distributed_tau": tau,
                 "distributed_nodes": nodes,
+                "staleness_mode": staleness_mode,
+                "zero_delay_nodes": zero_delay_nodes,
                 "progress_interval_seconds": None,
                 "elapsed_seconds": None,
             }
@@ -239,6 +286,8 @@ def train_distributed(
                     "node": node,
                     "staleness": 0,
                     "source_model_version": 0,
+                    "staleness_mode": staleness_mode,
+                    "zero_delay_nodes": zero_delay_nodes,
                     **version_basic_metrics[0],
                     "progress_measures": metric_cache.get(0),
                 }
@@ -251,6 +300,12 @@ def train_distributed(
                 available_versions = {version for version, _ in history}
                 if tau == 0 or step < tau:
                     lags = [0] * nodes
+                elif staleness_mode == "mixed_fixed":
+                    assert zero_delay_nodes is not None
+                    lags = [
+                        0 if node < zero_delay_nodes else tau
+                        for node in range(nodes)
+                    ]
                 else:
                     lags = [
                         staleness_rng.randint(1, tau)
@@ -318,6 +373,8 @@ def train_distributed(
                     "node_source_versions": source_versions,
                     "distributed_tau": tau,
                     "distributed_nodes": nodes,
+                    "staleness_mode": staleness_mode,
+                    "zero_delay_nodes": zero_delay_nodes,
                 }
                 mechanistic_due = (
                     new_version % int(logging["mechanistic_metrics_interval"]) == 0
@@ -363,6 +420,8 @@ def train_distributed(
                         "node": node,
                         "staleness": lag,
                         "source_model_version": source_version,
+                        "staleness_mode": staleness_mode,
+                        "zero_delay_nodes": zero_delay_nodes,
                         **version_basic_metrics[source_version],
                     }
                     if mechanistic_due:
