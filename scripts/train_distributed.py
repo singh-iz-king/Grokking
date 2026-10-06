@@ -21,6 +21,7 @@ def run_learning_rate_sweep(
     run_dir: str | Path | None = None,
     staleness_mode: str = "uniform",
     zero_delay_nodes: int | None = None,
+    nodes: int = NODE_COUNT,
 ) -> list[tuple[float, float, Path]]:
     """Run the configured LR and its 0.1x / 0.01x variants sequentially."""
     base_learning_rate = float(config["optimizer"]["learning_rate"])
@@ -34,9 +35,12 @@ def run_learning_rate_sweep(
             f"{config['experiment']['name']}_{tag}"
         )
         if staleness_mode == "mixed_fixed":
-            mode_tag = f"mixed_fixed_tau_{tau}_zero_delay_nodes_{zero_delay_nodes}"
+            mode_tag = (
+                f"mixed_fixed_tau_{tau}_zero_delay_nodes_{zero_delay_nodes}"
+                f"_nodes_{nodes}"
+            )
         else:
-            mode_tag = f"uniform_tau_{tau}"
+            mode_tag = f"uniform_tau_{tau}_nodes_{nodes}"
         run_tag = f"{mode_tag}_{tag}"
         specific_run_dir = Path(run_dir) / run_tag if run_dir is not None else None
 
@@ -49,7 +53,7 @@ def run_learning_rate_sweep(
         output_dir = train_distributed(
             run_config,
             tau=tau,
-            nodes=NODE_COUNT,
+            nodes=nodes,
             run_dir=specific_run_dir,
             staleness_mode=staleness_mode,
             zero_delay_nodes=zero_delay_nodes,
@@ -67,7 +71,7 @@ def run_learning_rate_sweep(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Simulate five-node asynchronous centralized Grokking training."
+        description="Simulate asynchronous centralized Grokking training."
     )
     parser.add_argument(
         "--config",
@@ -79,6 +83,12 @@ def main() -> None:
         type=int,
         default=None,
         help="Maximum staleness in global updates; 0 gives synchronous centralized training.",
+    )
+    parser.add_argument(
+        "--nodes",
+        type=int,
+        default=NODE_COUNT,
+        help=f"Number of logical nodes (default: {NODE_COUNT}).",
     )
     parser.add_argument(
         "--fixed-delay",
@@ -106,6 +116,8 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.nodes < 1:
+        parser.error("--nodes must be a positive integer")
     if args.fixed_delay is not None or args.zero_delay_nodes is not None:
         if args.fixed_delay is None or args.zero_delay_nodes is None:
             parser.error("--fixed-delay and --zero-delay-nodes must be provided together")
@@ -113,8 +125,8 @@ def main() -> None:
             parser.error("use either --tau or --fixed-delay, not both")
         if args.fixed_delay < 0:
             parser.error("--fixed-delay must be nonnegative")
-        if not 0 <= args.zero_delay_nodes <= NODE_COUNT:
-            parser.error(f"--zero-delay-nodes must be between 0 and {NODE_COUNT}")
+        if not 0 <= args.zero_delay_nodes <= args.nodes:
+            parser.error(f"--zero-delay-nodes must be between 0 and {args.nodes}")
         tau = args.fixed_delay
         staleness_mode = "mixed_fixed"
         zero_delay_nodes = args.zero_delay_nodes
@@ -133,6 +145,7 @@ def main() -> None:
             run_dir=args.run_dir,
             staleness_mode=staleness_mode,
             zero_delay_nodes=zero_delay_nodes,
+            nodes=args.nodes,
         )
         print("\nStep-size sweep complete:", flush=True)
         for factor, learning_rate, output_dir in results:
@@ -146,7 +159,7 @@ def main() -> None:
     run_dir = train_distributed(
         config,
         tau=tau,
-        nodes=NODE_COUNT,
+        nodes=args.nodes,
         run_dir=args.run_dir,
         staleness_mode=staleness_mode,
         zero_delay_nodes=zero_delay_nodes,

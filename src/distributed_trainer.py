@@ -57,7 +57,7 @@ def _save_distributed_checkpoint(
             "train_indices": data.train_indices,
             "test_indices": data.test_indices,
             "distributed_state": {
-                "nodes": NODE_COUNT,
+                "nodes": config["distributed"]["nodes"],
                 "tau": config["distributed"]["tau"],
                 "staleness_mode": config["distributed"]["staleness_mode"],
                 "zero_delay_nodes": config["distributed"]["zero_delay_nodes"],
@@ -96,8 +96,8 @@ def train_distributed(
     applies the mean of those gradients to the latest global model once.
     """
     validate_config(config)
-    if nodes != NODE_COUNT:
-        raise ValueError(f"this experiment is defined for exactly {NODE_COUNT} nodes")
+    if nodes < 1:
+        raise ValueError("nodes must be a positive integer")
     if tau < 0:
         raise ValueError("tau must be nonnegative")
     if staleness_mode not in {"uniform", "mixed_fixed"}:
@@ -140,10 +140,12 @@ def train_distributed(
     if staleness_mode == "mixed_fixed":
         experiment["name"] = (
             f"{experiment['name']}_distributed_mixed_fixed_tau{tau}"
-            f"_zero_delay_nodes{zero_delay_nodes}"
+            f"_zero_delay_nodes{zero_delay_nodes}_nodes{nodes}"
         )
     else:
-        experiment["name"] = f"{experiment['name']}_distributed_async_tau{tau}"
+        experiment["name"] = (
+            f"{experiment['name']}_distributed_async_tau{tau}_nodes{nodes}"
+        )
     effective_config["experiment"] = experiment
 
     if run_dir is not None:

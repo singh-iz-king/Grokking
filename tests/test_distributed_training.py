@@ -85,6 +85,26 @@ def test_tau_zero_matches_canonical_adamw_updates(tmp_path, capsys) -> None:
     assert all("train_accuracy" in row for row in node_rows)
 
 
+def test_distributed_node_count_configures_metrics_and_checkpoint(tmp_path, capsys) -> None:
+    config = _config(tmp_path, epochs=2, mechanistic_interval=2)
+    run_dir = train_distributed(
+        config, tau=0, nodes=3, run_dir=tmp_path / "three_nodes"
+    )
+    capsys.readouterr()
+
+    rows = _read_jsonl(run_dir / "metrics.jsonl")
+    assert all(len(row["staleness"]) == 3 for row in rows)
+    node_rows = _read_jsonl(run_dir / "node_metrics.jsonl")
+    assert len(node_rows) == 3 * 3
+    assert {row["node"] for row in node_rows} == {0, 1, 2}
+    saved_config = __import__("yaml").safe_load(
+        (run_dir / "config.yaml").read_text()
+    )
+    assert saved_config["distributed"]["nodes"] == 3
+    checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
+    assert checkpoint["distributed_state"]["nodes"] == 3
+
+
 def test_positive_tau_warms_up_then_samples_valid_staleness(tmp_path, capsys) -> None:
     config = _config(tmp_path, epochs=6, mechanistic_interval=6)
     run_dir = train_distributed(
@@ -130,32 +150,33 @@ def test_mixed_fixed_delay_keeps_first_n_nodes_fresh(tmp_path, capsys) -> None:
     run_dir = train_distributed(
         config,
         tau=2,
+        nodes=4,
         staleness_mode="mixed_fixed",
         zero_delay_nodes=2,
         run_dir=tmp_path / "mixed_delay",
     )
     output = capsys.readouterr().out
     assert "zero-delay nodes [0, 1] use lag 0" in output
-    assert "delayed nodes [2, 3, 4] use fixed lag 2" in output
+    assert "delayed nodes [2, 3] use fixed lag 2" in output
 
     rows = _read_jsonl(run_dir / "metrics.jsonl")
-    assert rows[1]["staleness"] == [0] * 5
-    assert rows[2]["staleness"] == [0] * 5
-    assert rows[3]["staleness"] == [0, 0, 2, 2, 2]
-    assert rows[3]["node_source_versions"] == [2, 2, 0, 0, 0]
-    assert rows[4]["staleness"] == [0, 0, 2, 2, 2]
+    assert rows[1]["staleness"] == [0] * 4
+    assert rows[2]["staleness"] == [0] * 4
+    assert rows[3]["staleness"] == [0, 0, 2, 2]
+    assert rows[3]["node_source_versions"] == [2, 2, 0, 0]
+    assert rows[4]["staleness"] == [0, 0, 2, 2]
 
     node_rows = _read_jsonl(run_dir / "node_metrics.jsonl")
     final_step = [row for row in node_rows if row["step"] == 5]
-    assert [row["staleness"] for row in final_step] == [0, 0, 2, 2, 2]
-    assert [row["source_model_version"] for row in final_step] == [4, 4, 2, 2, 2]
+    assert [row["staleness"] for row in final_step] == [0, 0, 2, 2]
+    assert [row["source_model_version"] for row in final_step] == [4, 4, 2, 2]
     checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
     state = checkpoint["distributed_state"]
     assert state["tau"] == 2
     assert state["staleness_mode"] == "mixed_fixed"
     assert state["zero_delay_nodes"] == 2
     assert state["zero_delay_node_ids"] == [0, 1]
-    assert state["delayed_node_ids"] == [2, 3, 4]
+    assert state["delayed_node_ids"] == [2, 3]
 
 
 def test_mixed_fixed_delay_all_zero_delay_and_invalid_count(tmp_path, capsys) -> None:
@@ -164,17 +185,19 @@ def test_mixed_fixed_delay_all_zero_delay_and_invalid_count(tmp_path, capsys) ->
         config,
         tau=1,
         staleness_mode="mixed_fixed",
-        zero_delay_nodes=5,
+        nodes=3,
+        zero_delay_nodes=3,
         run_dir=tmp_path / "all_fresh",
     )
     capsys.readouterr()
     rows = _read_jsonl(run_dir / "metrics.jsonl")
-    assert all(row["staleness"] == [0] * 5 for row in rows)
+    assert all(row["staleness"] == [0] * 3 for row in rows)
 
     try:
         train_distributed(
             config,
             tau=1,
+            nodes=5,
             staleness_mode="mixed_fixed",
             zero_delay_nodes=6,
             run_dir=tmp_path / "invalid_count",
@@ -225,12 +248,13 @@ def test_learning_rate_sweep_supports_mixed_fixed_delay(tmp_path, capsys) -> Non
         tau=2,
         staleness_mode="mixed_fixed",
         zero_delay_nodes=1,
+        nodes=3,
         run_dir=tmp_path / "mixed_sweep",
     )
     capsys.readouterr()
 
     for _, _, run_dir in results:
-        assert "mixed_fixed_tau_2_zero_delay_nodes_1" in run_dir.name
+        assert "mixed_fixed_tau_2_zero_delay_nodes_1_nodes_3" in run_dir.name
         assert "lr_factor_" in run_dir.name
         saved_config = __import__("yaml").safe_load(
             run_dir.joinpath("config.yaml").read_text()
