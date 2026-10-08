@@ -4,7 +4,10 @@ import torch
 
 from src.distributed_trainer import train_distributed
 from src.plotting import plot_node_metrics, plot_results
-from scripts.train_distributed import run_learning_rate_sweep
+from scripts.train_distributed import (
+    run_fixed_delay_composition_sweep,
+    run_learning_rate_sweep,
+)
 from src.trainer import train
 
 
@@ -288,3 +291,37 @@ def test_learning_rate_sweep_supports_mixed_fixed_delay(tmp_path, capsys) -> Non
         assert saved_config["distributed"]["zero_delay_nodes"] == 1
         checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
         assert checkpoint["distributed_state"]["staleness_mode"] == "mixed_fixed"
+
+
+def test_fixed_delay_composition_sweep_runs_all_node_assignments(
+    tmp_path, capsys
+) -> None:
+    config = _config(tmp_path, epochs=1, mechanistic_interval=2)
+    config["logging"]["ablation_interval"] = 2
+    config["output"]["save_plots"] = False
+    results = run_fixed_delay_composition_sweep(
+        config,
+        tau=2,
+        nodes=3,
+        run_dir=tmp_path / "composition_sweep",
+    )
+    capsys.readouterr()
+
+    assert [zero_delay_nodes for zero_delay_nodes, _ in results] == [0, 1, 2, 3]
+    assert len({run_dir for _, run_dir in results}) == 4
+    for zero_delay_nodes, run_dir in results:
+        assert (
+            f"mixed_fixed_tau_2_zero_delay_nodes_{zero_delay_nodes}_nodes_3"
+            in run_dir.name
+        )
+        saved_config = __import__("yaml").safe_load(
+            (run_dir / "config.yaml").read_text()
+        )
+        assert saved_config["distributed"]["nodes"] == 3
+        assert saved_config["distributed"]["tau"] == 2
+        assert saved_config["distributed"]["zero_delay_nodes"] == zero_delay_nodes
+        checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
+        assert (
+            checkpoint["distributed_state"]["zero_delay_nodes"]
+            == zero_delay_nodes
+        )

@@ -127,6 +127,8 @@ The explicit fixed-delay CLI mode,
 `python -m scripts.train_distributed --fixed-delay TAU --zero-delay-nodes N`,
 uses the same configurable-node gradient aggregation and evaluation path (`--nodes COUNT`, default 5) but deterministically assigns node IDs `[0, ..., N-1]` lag 0 and IDs `[N, ..., COUNT-1]` lag exactly `TAU`. During startup all nodes use the current model until a model version `t-TAU` exists; afterward, a delayed node at version \(t\) reads exactly that version, while zero-delay nodes read \(t\). `N=0` means all nodes are delayed; `N=COUNT` means all nodes are fresh. `TAU=0` makes all nodes fresh regardless of `N`. The `--tau` uniform-random mode is unchanged, and the two CLI modes cannot be combined in one run. The effective YAML, checkpoint metadata, global/node metric records, and run directory identify the selected mode, node count, and assignment.
 
+`--fixed-delay-sweep` runs this mixed mode once for each `N` in `0..COUNT`, holding the selected delay and every other configuration value fixed. For example, `--fixed-delay 5 --nodes 5 --fixed-delay-sweep` produces six runs spanning all-delayed through all-zero-delay assignments. Each run is saved separately with its assignment in the output name and configuration.
+
 Distributed metrics have two scopes:
 
 - `metrics.jsonl` / `metrics.csv` store train/test loss and accuracy for the **new global model** after every global update, along with the sampled node lags and source versions.

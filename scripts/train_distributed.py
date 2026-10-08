@@ -69,6 +69,45 @@ def run_learning_rate_sweep(
     return results
 
 
+def run_fixed_delay_composition_sweep(
+    config: dict,
+    tau: int,
+    nodes: int = NODE_COUNT,
+    run_dir: str | Path | None = None,
+) -> list[tuple[int, Path]]:
+    """Run fixed-delay experiments for every zero-delay node count."""
+    results: list[tuple[int, Path]] = []
+    for zero_delay_nodes in range(nodes + 1):
+        tag = (
+            f"mixed_fixed_tau_{tau}_zero_delay_nodes_{zero_delay_nodes}"
+            f"_nodes_{nodes}"
+        )
+        specific_run_dir = Path(run_dir) / tag if run_dir is not None else None
+        print(
+            f"\nFixed-delay composition sweep: tau={tau} | nodes={nodes} | "
+            f"zero-delay nodes={zero_delay_nodes} | delayed nodes="
+            f"{nodes - zero_delay_nodes}",
+            flush=True,
+        )
+        output_dir = train_distributed(
+            config,
+            tau=tau,
+            nodes=nodes,
+            run_dir=specific_run_dir,
+            staleness_mode="mixed_fixed",
+            zero_delay_nodes=zero_delay_nodes,
+        )
+        if config["output"]["save_plots"]:
+            figures = plot_results(output_dir)
+            node_figures = plot_node_metrics(output_dir)
+            print(
+                f"Figures saved to {figures}; per-node figures saved to {node_figures}",
+                flush=True,
+            )
+        results.append((zero_delay_nodes, output_dir))
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Simulate asynchronous centralized Grokking training."
@@ -106,6 +145,14 @@ def main() -> None:
             "remaining nodes use the fixed delay."
         ),
     )
+    parser.add_argument(
+        "--fixed-delay-sweep",
+        action="store_true",
+        help=(
+            "With --fixed-delay and --nodes, run once for every zero-delay "
+            "node count from 0 through the total."
+        ),
+    )
     parser.add_argument("--run-dir", help="Optional new output directory (must not exist).")
     parser.add_argument(
         "--step-size-sweep",
@@ -118,6 +165,32 @@ def main() -> None:
     args = parser.parse_args()
     if args.nodes < 1:
         parser.error("--nodes must be a positive integer")
+    if args.fixed_delay_sweep:
+        if args.fixed_delay is None:
+            parser.error("--fixed-delay-sweep requires --fixed-delay")
+        if args.zero_delay_nodes is not None:
+            parser.error("--fixed-delay-sweep cannot be combined with --zero-delay-nodes")
+        if args.tau is not None:
+            parser.error("use --fixed-delay-sweep with --fixed-delay, not --tau")
+        if args.fixed_delay < 0:
+            parser.error("--fixed-delay must be nonnegative")
+        if args.step_size_sweep:
+            parser.error("--fixed-delay-sweep cannot be combined with --step-size-sweep")
+        config = load_config(args.config)
+        results = run_fixed_delay_composition_sweep(
+            config,
+            tau=args.fixed_delay,
+            nodes=args.nodes,
+            run_dir=args.run_dir,
+        )
+        print("\nFixed-delay composition sweep complete:", flush=True)
+        for zero_delay_nodes, output_dir in results:
+            print(
+                f"  zero-delay nodes={zero_delay_nodes} | "
+                f"delayed nodes={args.nodes - zero_delay_nodes} | run={output_dir}",
+                flush=True,
+            )
+        return
     if args.fixed_delay is not None or args.zero_delay_nodes is not None:
         if args.fixed_delay is None or args.zero_delay_nodes is None:
             parser.error("--fixed-delay and --zero-delay-nodes must be provided together")

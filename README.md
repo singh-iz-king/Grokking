@@ -82,6 +82,15 @@ This assigns nodes `[0, 1]` to lag 0 and nodes `[2, 3, 4]` to lag 5. As in the u
 
 The fixed-delay mode also supports `--step-size-sweep`. Its run directories identify the staleness mode, delay, zero-delay node count, and learning-rate factor/rate.
 
+To compare every zero-delay/delayed node composition at one fixed delay, use `--fixed-delay-sweep` with `--fixed-delay` and optionally set `--nodes`:
+
+```bash
+python -m scripts.train_distributed --config configs/modular_addition_p113.yaml \
+  --fixed-delay 5 --nodes 5 --fixed-delay-sweep
+```
+
+This runs six separate experiments, from 0 zero-delay nodes / 5 delayed nodes through 5 zero-delay nodes / 0 delayed nodes. The delay, node count, seed, data split, optimizer, and all other settings remain fixed. Each run has a distinct directory tagged with the delay, zero-delay count, and total node count; if `--run-dir` is supplied, it serves as the parent directory. This sweep cannot be combined with `--zero-delay-nodes` or `--step-size-sweep`.
+
 To compare learning rates at a fixed τ, add `--step-size-sweep`:
 
 ```bash
