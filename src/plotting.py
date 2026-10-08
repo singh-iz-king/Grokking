@@ -213,6 +213,13 @@ def plot_results(run_dir: str | Path) -> Path:
                  "L2 norm", figures_dir / "weight_l2_norm.png")
     _plot_series(
         rows,
+        ["aggregated_momentum_l2_norm"],
+        "L2 norm of aggregated AdamW first moment",
+        "L2 norm of exp_avg",
+        figures_dir / "aggregated_momentum_l2_norm.png",
+    )
+    _plot_series(
+        rows,
         ["embedding_fourier_gini", "logit_map_fourier_gini"],
         "Fourier-component Gini coefficients",
         "Gini coefficient",
@@ -363,6 +370,71 @@ def _plot_node_frequency_ablations(
     plt.close(fig)
 
 
+def _plot_distributed_gradient_norms(
+    rows: list[dict[str, Any]],
+    figures_dir: Path,
+) -> None:
+    per_node: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    by_delay_status: dict[bool, dict[int, list[float]]] = {
+        False: defaultdict(list),
+        True: defaultdict(list),
+    }
+    for row in rows:
+        value = row.get("gradient_l2_norm")
+        if not isinstance(value, (int, float)):
+            continue
+        step = int(row["step"])
+        node = int(row["node"])
+        per_node[node].append((step, float(value)))
+        has_delay = bool(row.get("has_delay", int(row.get("staleness", 0)) > 0))
+        by_delay_status[has_delay][step].append(float(value))
+
+    if per_node:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for node, points in sorted(per_node.items()):
+            ax.plot(
+                [step for step, _ in points],
+                [value for _, value in points],
+                linewidth=0.9,
+                label=f"Node {node}",
+            )
+        ax.set(
+            title="Per-node full-batch gradient norms",
+            xlabel="Global step",
+            ylabel="Gradient L2 norm",
+        )
+        ax.legend(ncol=2)
+        ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(figures_dir / "gradient_norms_by_node.png", dpi=160)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for has_delay, label in ((False, "No delay"), (True, "Has delay")):
+            points = [
+                (step, sum(values) / len(values))
+                for step, values in sorted(by_delay_status[has_delay].items())
+            ]
+            if points:
+                ax.plot(
+                    [step for step, _ in points],
+                    [value for _, value in points],
+                    marker=".",
+                    markersize=3,
+                    label=label,
+                )
+        ax.set(
+            title="Mean node gradient norm by delay status",
+            xlabel="Global step",
+            ylabel="Mean gradient L2 norm",
+        )
+        ax.legend()
+        ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(figures_dir / "gradient_norms_by_delay_status.png", dpi=160)
+        plt.close(fig)
+
+
 def plot_node_metrics(run_dir: str | Path) -> Path:
     """Plot global-step and mechanistic histories separately for each node."""
     run_dir = Path(run_dir)
@@ -376,6 +448,7 @@ def plot_node_metrics(run_dir: str | Path) -> Path:
 
     output_root = run_dir / "figures" / "nodes"
     output_root.mkdir(parents=True, exist_ok=True)
+    _plot_distributed_gradient_norms(rows, run_dir / "figures")
     nodes = sorted({int(row["node"]) for row in rows})
     for node in nodes:
         node_rows = []
@@ -407,6 +480,13 @@ def plot_node_metrics(run_dir: str | Path) -> Path:
                 ("train_accuracy", "test_accuracy"),
                 "Training and test accuracy",
                 "Accuracy",
+                False,
+            ),
+            (
+                "gradient_l2_norm.png",
+                ("gradient_l2_norm",),
+                "Full-batch gradient L2 norm",
+                "Gradient L2 norm",
                 False,
             ),
         ):

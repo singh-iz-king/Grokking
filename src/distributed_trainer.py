@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import shutil
 import time
@@ -24,6 +25,27 @@ from src.trainer import _build_model, _print_run_summary
 from src.utils import environment_info, seed_everything, write_json
 
 NODE_COUNT = 5
+
+
+def _gradient_l2_norm(parameters: list[nn.Parameter]) -> float:
+    norms = [
+        float(torch.linalg.vector_norm(parameter.grad.detach()).item())
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    return math.hypot(*norms)
+
+
+def _adam_first_moment_l2_norm(
+    optimizer: torch.optim.Optimizer,
+    parameters: list[nn.Parameter],
+) -> float:
+    norms = [
+        float(torch.linalg.vector_norm(optimizer.state[parameter]["exp_avg"]).item())
+        for parameter in parameters
+        if "exp_avg" in optimizer.state[parameter]
+    ]
+    return math.hypot(*norms)
 
 
 def _snapshot(model: nn.Module) -> dict[str, Tensor]:
@@ -194,6 +216,7 @@ def train_distributed(
         eps=float(optimizer_config["epsilon"]),
         weight_decay=float(optimizer_config["weight_decay"]),
     )
+    parameters = list(model.parameters())
     warmup = int(optimizer_config["warmup_steps"])
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -263,6 +286,7 @@ def train_distributed(
                 "distributed_nodes": nodes,
                 "staleness_mode": staleness_mode,
                 "zero_delay_nodes": zero_delay_nodes,
+                "aggregated_momentum_l2_norm": 0.0,
                 "progress_interval_seconds": None,
                 "elapsed_seconds": None,
             }
@@ -287,6 +311,8 @@ def train_distributed(
                     "step": 0,
                     "node": node,
                     "staleness": 0,
+                    "has_delay": False,
+                    "gradient_l2_norm": None,
                     "source_model_version": 0,
                     "staleness_mode": staleness_mode,
                     "zero_delay_nodes": zero_delay_nodes,
@@ -323,8 +349,9 @@ def train_distributed(
                     )
 
                 accumulated_gradients: list[Tensor | None] = [
-                    None for _ in model.parameters()
+                    None for _ in parameters
                 ]
+                node_gradient_norms: list[float] = []
                 for source_version in source_versions:
                     model.load_state_dict(history_by_version[source_version])
                     model.train()
@@ -333,7 +360,8 @@ def train_distributed(
                     assert isinstance(logits, Tensor)
                     loss = cross_entropy(logits[:, -1], train_labels)
                     loss.backward()
-                    for index, parameter in enumerate(model.parameters()):
+                    node_gradient_norms.append(_gradient_l2_norm(parameters))
+                    for index, parameter in enumerate(parameters):
                         if parameter.grad is not None:
                             gradient = parameter.grad.detach().clone()
                             if accumulated_gradients[index] is None:
@@ -343,12 +371,15 @@ def train_distributed(
 
                 model.load_state_dict(current_state)
                 optimizer.zero_grad(set_to_none=True)
-                for parameter, gradient in zip(model.parameters(), accumulated_gradients):
+                for parameter, gradient in zip(parameters, accumulated_gradients):
                     if gradient is not None:
                         parameter.grad = gradient.div_(nodes)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                aggregated_momentum_l2_norm = _adam_first_moment_l2_norm(
+                    optimizer, parameters
+                )
 
                 new_version = global_version + 1
                 new_state = _snapshot(model)
@@ -377,6 +408,7 @@ def train_distributed(
                     "distributed_nodes": nodes,
                     "staleness_mode": staleness_mode,
                     "zero_delay_nodes": zero_delay_nodes,
+                    "aggregated_momentum_l2_norm": aggregated_momentum_l2_norm,
                 }
                 mechanistic_due = (
                     new_version % int(logging["mechanistic_metrics_interval"]) == 0
@@ -416,11 +448,15 @@ def train_distributed(
                 model.load_state_dict(new_state)
 
                 node_records = []
-                for node, (lag, source_version) in enumerate(zip(lags, source_versions)):
+                for node, (lag, source_version, gradient_norm) in enumerate(
+                    zip(lags, source_versions, node_gradient_norms)
+                ):
                     node_record: dict[str, Any] = {
                         "step": new_version,
                         "node": node,
                         "staleness": lag,
+                        "has_delay": lag > 0,
+                        "gradient_l2_norm": gradient_norm,
                         "source_model_version": source_version,
                         "staleness_mode": staleness_mode,
                         "zero_delay_nodes": zero_delay_nodes,

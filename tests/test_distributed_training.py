@@ -3,7 +3,7 @@ import json
 import torch
 
 from src.distributed_trainer import train_distributed
-from src.plotting import plot_node_metrics
+from src.plotting import plot_node_metrics, plot_results
 from scripts.train_distributed import run_learning_rate_sweep
 from src.trainer import train
 
@@ -82,7 +82,30 @@ def test_tau_zero_matches_canonical_adamw_updates(tmp_path, capsys) -> None:
     node_rows = _read_jsonl(distributed_dir / "node_metrics.jsonl")
     assert len(node_rows) == 5 * 3
     assert all(row["staleness"] == 0 for row in node_rows)
+    assert all(row["has_delay"] is False for row in node_rows)
+    for start in range(5, len(node_rows), 5):
+        assert len({
+            row["gradient_l2_norm"]
+            for row in node_rows[start:start + 5]
+        }) == 1
+    assert all(
+        isinstance(row["gradient_l2_norm"], (int, float))
+        for row in node_rows
+        if row["step"] > 0
+    )
     assert all("train_accuracy" in row for row in node_rows)
+    assert rows[0]["aggregated_momentum_l2_norm"] == 0.0
+    assert all(
+        row["aggregated_momentum_l2_norm"] > 0.0 for row in rows[1:]
+    )
+    plot_results(distributed_dir)
+    figures = plot_node_metrics(distributed_dir)
+    assert (distributed_dir / "figures" / "aggregated_momentum_l2_norm.png").is_file()
+    assert (distributed_dir / "figures" / "gradient_norms_by_node.png").is_file()
+    assert (
+        distributed_dir / "figures" / "gradient_norms_by_delay_status.png"
+    ).is_file()
+    assert (figures / "node_0" / "gradient_l2_norm.png").is_file()
 
 
 def test_distributed_node_count_configures_metrics_and_checkpoint(tmp_path, capsys) -> None:
@@ -169,6 +192,8 @@ def test_mixed_fixed_delay_keeps_first_n_nodes_fresh(tmp_path, capsys) -> None:
     node_rows = _read_jsonl(run_dir / "node_metrics.jsonl")
     final_step = [row for row in node_rows if row["step"] == 5]
     assert [row["staleness"] for row in final_step] == [0, 0, 2, 2]
+    assert [row["has_delay"] for row in final_step] == [False, False, True, True]
+    assert all(isinstance(row["gradient_l2_norm"], float) for row in final_step)
     assert [row["source_model_version"] for row in final_step] == [4, 4, 2, 2]
     checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
     state = checkpoint["distributed_state"]
