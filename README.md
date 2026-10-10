@@ -111,6 +111,19 @@ The `*_keys.png` plots deliberately separate fixed paper frequencies (`14, 35, 4
 
 For runs created before fixed-versus-discovered metric fields were added, plot regeneration can only show values that were actually saved. It cannot reconstruct absent discovered-key accuracy/exclusion values without the corresponding model checkpoints.
 
+## Summarize experiment runs
+
+Create `experiment_summary.csv` with one row per run by passing one or more run directories or parent directories (searched recursively):
+
+```bash
+python -m scripts.summarize_experiments results/ --output experiment_summary.csv \
+  --stable-window-steps 1000
+```
+
+`stable99` is the first measured test-evaluation step whose consecutive measured test accuracies stay at or above 0.99 for at least the configured window span. Gaps larger than the configured validation interval break a candidate stable window. `stable_window_steps` and the observed test-evaluation cadence are included in the CSV. The calculation uses only recorded evaluation points; it does not interpolate or claim accuracy for unmeasured steps. `collapse_count` counts contiguous logged evaluations below 0.90 after the first recorded test accuracy of at least 0.99. Post-threshold mean/min include the first ≥0.99 observation and all later measured test accuracies.
+
+The summary includes the time unit, evaluation cadence, train/test/total example counts, and whether every discovered run used identical train and test indices. The seed-controlled split is reconstructed from each saved configuration. For mixed fixed-delay runs, `m` is the configured number of delayed nodes and `d` is the fixed delay; for canonical runs both are zero. For uniform-τ runs, `m` and `d` are `NA` because per-node delays vary; staleness mode, configured τ, and node count are included in additional columns. Run IDs use the saved runtime run-directory basename when available, with the saved experiment name and seed retained in their own columns.
+
 ## Outputs
 
 Runs are written under `results/` by default. A run directory contains:
