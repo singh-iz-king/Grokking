@@ -5,6 +5,7 @@ from scripts.summarize_experiments import (
     _stable_window_start,
     summarize_experiments,
 )
+from scripts.audit_diagnostics import audit_diagnostics
 
 
 def _create_run(
@@ -140,3 +141,65 @@ def test_stable_window_does_not_bridge_unmeasured_intervals():
         threshold=0.99,
         max_sampling_gap=10,
     ) == "NA"
+
+
+def test_diagnostic_audit_reports_logged_and_checkpoint_derived_data(tmp_path):
+    run_dir = tmp_path / "audited"
+    _create_run(run_dir)
+    rows = []
+    for step in range(3):
+        rows.append({
+            "step": step,
+            "train_loss": 1.0,
+            "test_loss": 1.2,
+            "train_accuracy": 0.9,
+            "test_accuracy": 0.8,
+            "model_version": step,
+            "node_source_versions": [step - 1],
+            "detected_key_frequencies": [1, 2],
+            "fixed_key_frequencies": [1],
+            "embedding_fourier_norms": [0.1, 0.2],
+            "excluded_loss_by_frequency": {"1": {"test_loss": 0.5}},
+            "aggregated_momentum_l2_norm": 0.7,
+        })
+    (run_dir / "metrics.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    (run_dir / "node_metrics.jsonl").write_text(
+        "".join(json.dumps({
+            "step": step,
+            "node": 0,
+            "gradient_l2_norm": 0.4,
+            "source_model_version": step - 1,
+        }) + "\n" for step in range(1, 4)),
+        encoding="utf-8",
+    )
+    (run_dir / "final.pt").write_bytes(b"checkpoint exists")
+    (run_dir / "fourier_spectra.csv").write_text(
+        "epoch,step,matrix,component_index,component,norm,squared_norm\n"
+        "2,2,embedding,0,DC,0.2,0.04\n",
+        encoding="utf-8",
+    )
+
+    output = audit_diagnostics([run_dir], tmp_path / "available_diagnostics.csv")
+    with output.open(newline="", encoding="utf-8") as handle:
+        audit_rows = list(csv.DictReader(handle))
+
+    assert len(audit_rows) == 16
+    by_name = {row["diagnostic"]: row for row in audit_rows}
+    assert by_name["train_loss"]["status"] == "logged"
+    assert by_name["train_loss"]["source_file"] == "metrics.jsonl"
+    assert by_name["per_node_gradient_norms"]["status"] == "logged"
+    assert by_name["per_node_gradient_norms"]["source_file"] == "node_metrics.jsonl"
+    assert by_name["per_node_gradient_vectors"]["status"] == "derivable offline"
+    assert by_name["stale_fresh_gradient_alignment"]["status"] == "requires new computation or run"
+    assert by_name["adam_first_moment"]["status"] == "logged"
+    assert by_name["adam_second_moment"]["status"] == "derivable offline"
+    assert by_name["actual_update_norm"]["status"] == "derivable offline"
+    assert by_name["fourier_amplitudes_norms"]["status"] == "logged"
+    assert by_name["fourier_complex_coefficients"]["status"] == "derivable offline"
+    assert by_name["discovered_key_frequencies"]["status"] == "logged"
+    assert by_name["frequency_ablation_metrics"]["status"] == "logged"
+    assert by_name["logits_and_margins"]["status"] == "derivable offline"
+    assert by_name["model_and_optimizer_checkpoints"]["status"] == "logged"

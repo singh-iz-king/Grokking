@@ -2,7 +2,7 @@ import json
 
 import torch
 
-from src.distributed_trainer import train_distributed
+from src.distributed_trainer import _gradient_alignment, train_distributed
 from src.plotting import plot_node_metrics, plot_results
 from scripts.train_distributed import (
     run_fixed_delay_composition_sweep,
@@ -109,6 +109,21 @@ def test_tau_zero_matches_canonical_adamw_updates(tmp_path, capsys) -> None:
         distributed_dir / "figures" / "gradient_norms_by_delay_status.png"
     ).is_file()
     assert (figures / "node_0" / "gradient_l2_norm.png").is_file()
+    assert (
+        distributed_dir / "figures" / "gradient_alignment.pdf"
+    ).is_file()
+
+
+def test_gradient_alignment_matches_known_vectors() -> None:
+    stale = [torch.tensor([1.0, 0.0]), torch.tensor([0.0])]
+    fresh = [torch.tensor([0.0, 1.0]), torch.tensor([0.0])]
+    cosine, relative_discrepancy = _gradient_alignment(stale, fresh)
+    assert abs(cosine) < 1e-10
+    assert abs(relative_discrepancy - 2**0.5) < 1e-10
+
+    cosine, relative_discrepancy = _gradient_alignment(fresh, fresh)
+    assert abs(cosine - 1.0) < 1e-10
+    assert relative_discrepancy == 0.0
 
 
 def test_distributed_node_count_configures_metrics_and_checkpoint(tmp_path, capsys) -> None:
@@ -197,6 +212,21 @@ def test_mixed_fixed_delay_keeps_first_n_nodes_fresh(tmp_path, capsys) -> None:
     assert [row["staleness"] for row in final_step] == [0, 0, 2, 2]
     assert [row["has_delay"] for row in final_step] == [False, False, True, True]
     assert all(isinstance(row["gradient_l2_norm"], float) for row in final_step)
+    assert all(
+        isinstance(row["gradient_cosine_similarity"], float)
+        and isinstance(row["gradient_relative_discrepancy"], float)
+        for row in final_step[2:]
+    )
+    assert all(
+        row["gradient_cosine_similarity"] is None
+        and row["gradient_relative_discrepancy"] is None
+        for row in final_step[:2]
+    )
+    assert isinstance(rows[4]["delayed_gradient_cosine_mean"], float)
+    assert isinstance(rows[4]["delayed_gradient_relative_discrepancy_mean"], float)
+    assert rows[4]["delayed_gradient_count"] == 2
+    plot_results(run_dir)
+    assert (run_dir / "figures" / "gradient_alignment.pdf").is_file()
     assert [row["source_model_version"] for row in final_step] == [4, 4, 2, 2]
     checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
     state = checkpoint["distributed_state"]

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
+from matplotlib.backends.backend_pdf import PdfPages
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -104,6 +105,155 @@ def _plot_spectra(run_dir: Path, figures_dir: Path, matrix: str, title: str) -> 
         fig.tight_layout()
         fig.savefig(figures_dir / f"{matrix}_fourier_norms.png", dpi=160)
     plt.close(fig)
+
+
+def plot_gradient_alignment(
+    run_dir: str | Path,
+    output_path: str | Path | None = None,
+) -> Path:
+    """Plot delayed-worker mean stale-vs-fresh gradient alignment."""
+    run_dir = Path(run_dir)
+    metrics_path = run_dir / "metrics.jsonl"
+    rows = _read_metrics(run_dir)
+    destination = (
+        Path(output_path)
+        if output_path is not None
+        else run_dir / "figures" / "gradient_alignment.pdf"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    cosine_points = [
+        (_row_step(row), float(row["delayed_gradient_cosine_mean"]))
+        for row in rows
+        if isinstance(row.get("delayed_gradient_cosine_mean"), (int, float))
+    ]
+    discrepancy_points = [
+        (_row_step(row), float(row["delayed_gradient_relative_discrepancy_mean"]))
+        for row in rows
+        if isinstance(
+            row.get("delayed_gradient_relative_discrepancy_mean"),
+            (int, float),
+        )
+    ]
+    run_config: dict[str, Any] = {}
+    config_path = run_dir / "config.yaml"
+    if config_path.is_file():
+        import yaml
+
+        with config_path.open(encoding="utf-8") as handle:
+            run_config = yaml.safe_load(handle) or {}
+    distributed = run_config.get("distributed", {})
+    epsilon = distributed.get("gradient_alignment", {}).get("epsilon", 1e-12)
+    run_id = run_config.get("runtime", {}).get("run_dir", run_dir.name)
+    first_99 = next(
+        (
+            _row_step(row)
+            for row in rows
+            if isinstance(row.get("test_accuracy"), (int, float))
+            and row["test_accuracy"] >= 0.99
+        ),
+        None,
+    )
+    collapse_intervals: list[tuple[int, int]] = []
+    collapse_start: int | None = None
+    collapse_end: int | None = None
+    if first_99 is not None:
+        for row in rows:
+            step = _row_step(row)
+            accuracy = row.get("test_accuracy")
+            if step < first_99 or not isinstance(accuracy, (int, float)):
+                continue
+            if accuracy < 0.90:
+                if collapse_start is None:
+                    collapse_start = step
+                collapse_end = step
+            elif collapse_start is not None and collapse_end is not None:
+                collapse_intervals.append((collapse_start, collapse_end))
+                collapse_start = None
+                collapse_end = None
+        if collapse_start is not None and collapse_end is not None:
+            collapse_intervals.append((collapse_start, collapse_end))
+
+    with PdfPages(destination) as pdf:
+        fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+        if cosine_points and discrepancy_points:
+            axes[0].plot(
+                [step for step, _ in cosine_points],
+                [value for _, value in cosine_points],
+                marker=".",
+                markersize=2.5,
+                linewidth=0.9,
+                label="Mean cosine over delayed workers",
+            )
+            axes[0].set_ylabel("Cosine similarity")
+            axes[0].set_ylim(-1.05, 1.05)
+            axes[0].legend(loc="best")
+            axes[0].grid(alpha=0.25)
+
+            axes[1].plot(
+                [step for step, _ in discrepancy_points],
+                [value for _, value in discrepancy_points],
+                marker=".",
+                markersize=2.5,
+                linewidth=0.9,
+                color="#dd8452",
+                label="Mean relative discrepancy over delayed workers",
+            )
+            axes[1].set_ylabel("Relative discrepancy")
+            axes[1].legend(loc="best")
+            axes[1].grid(alpha=0.25)
+            for ax in axes:
+                for index, (start, end) in enumerate(collapse_intervals):
+                    ax.axvspan(
+                        start, end,
+                        color="#c44e52",
+                        alpha=0.15,
+                        label="Test accuracy <0.90 episode" if index == 0 else None,
+                    )
+                if collapse_intervals:
+                    ax.legend(loc="best")
+            axes[1].set_xlabel("Global optimizer step")
+            fig.suptitle(
+                f"Are stale gradients misdirected?\n{Path(run_id).name}",
+                fontsize=13,
+            )
+            fig.text(
+                0.01, 0.01,
+                "Per delayed worker, compare its same-data full-batch gradient at the stale source "
+                "parameters with a fresh gradient at the current global parameters. Curves show the "
+                "arithmetic mean across workers with positive lag. Cosine = <g_stale,g_fresh> / "
+                "(||g_stale|| ||g_fresh|| + epsilon); relative discrepancy = "
+                "||g_stale-g_fresh|| / (||g_fresh|| + epsilon). "
+                f"epsilon={epsilon:g}. Shading marks contiguous measured test-accuracy <0.90 "
+                "episodes after first measured >=0.99. Points are per-step records; no interpolation.",
+                fontsize=7.5,
+            )
+        else:
+            for ax in axes:
+                ax.axis("off")
+            reason = (
+                "The run has no delayed-worker gradient-alignment values in metrics.jsonl. "
+                "Existing gradient-norm records cannot recover cosine similarity or relative "
+                "discrepancy. This run predates alignment logging or contains no delayed updates; "
+                "a targeted run with fresh/stale gradient comparisons is required."
+                if metrics_path.is_file()
+                else f"Missing metrics file: {metrics_path}"
+            )
+            axes[0].text(
+                0.5, 0.55, "NOT YET AVAILABLE",
+                ha="center", va="center", transform=axes[0].transAxes,
+                fontsize=18, color="#9b3d3d", weight="bold",
+            )
+            axes[1].text(
+                0.5, 0.55, reason,
+                ha="center", va="center", transform=axes[1].transAxes,
+                wrap=True, fontsize=11,
+            )
+            fig.suptitle(f"Are stale gradients misdirected?\n{Path(run_id).name}")
+        fig.tight_layout(rect=(0, 0.07, 1, 0.91))
+        pdf.savefig(fig)
+        plt.close(fig)
+    return destination
 
 
 def _plot_frequency_ablations(
@@ -218,6 +368,8 @@ def plot_results(run_dir: str | Path) -> Path:
         "L2 norm of exp_avg",
         figures_dir / "aggregated_momentum_l2_norm.png",
     )
+    if (run_dir / "node_metrics.jsonl").is_file():
+        plot_gradient_alignment(run_dir)
     _plot_series(
         rows,
         ["embedding_fourier_gini", "logit_map_fourier_gini"],

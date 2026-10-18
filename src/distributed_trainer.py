@@ -25,6 +25,7 @@ from src.trainer import _build_model, _print_run_summary
 from src.utils import environment_info, seed_everything, write_json
 
 NODE_COUNT = 5
+GRADIENT_ALIGNMENT_EPSILON = 1e-12
 
 
 def _gradient_l2_norm(parameters: list[nn.Parameter]) -> float:
@@ -34,6 +35,39 @@ def _gradient_l2_norm(parameters: list[nn.Parameter]) -> float:
         if parameter.grad is not None
     ]
     return math.hypot(*norms)
+
+
+def _gradient_alignment(
+    stale_gradients: list[Tensor | None],
+    fresh_gradients: list[Tensor | None],
+    epsilon: float = GRADIENT_ALIGNMENT_EPSILON,
+) -> tuple[float, float]:
+    components: list[Tensor] = []
+    for stale, fresh in zip(stale_gradients, fresh_gradients):
+        if stale is None and fresh is None:
+            continue
+        if stale is None:
+            assert fresh is not None
+            stale = torch.zeros_like(fresh)
+        if fresh is None:
+            fresh = torch.zeros_like(stale)
+        components.append(torch.stack((
+            torch.sum(stale * fresh),
+            torch.sum(stale.square()),
+            torch.sum(fresh.square()),
+            torch.sum((stale - fresh).square()),
+        )))
+
+    if not components:
+        return 0.0, 0.0
+    dot_product, stale_squared_norm, fresh_squared_norm, difference_squared_norm = (
+        torch.stack(components).sum(dim=0).detach().cpu().tolist()
+    )
+    stale_norm = math.sqrt(stale_squared_norm)
+    fresh_norm = math.sqrt(fresh_squared_norm)
+    cosine = dot_product / (stale_norm * fresh_norm + epsilon)
+    relative_discrepancy = math.sqrt(difference_squared_norm) / (fresh_norm + epsilon)
+    return cosine, relative_discrepancy
 
 
 def _adam_first_moment_l2_norm(
@@ -155,6 +189,12 @@ def train_distributed(
         ),
         "aggregation": "mean_of_full_batch_node_gradients",
         "optimizer_semantics": "canonical_adamw_applied_once_per_global_step",
+        "gradient_alignment": {
+            "enabled": True,
+            "definition": "per_delayed_node_stale_vs_current_gradient_on_same_full_batch",
+            "epsilon": GRADIENT_ALIGNMENT_EPSILON,
+            "fresh_gradient_computations_per_step": 1,
+        },
         "startup": "synchronous_until_tau_history_steps_exist",
         "node_metrics": "selected_gradient_source_model",
     }
@@ -287,6 +327,9 @@ def train_distributed(
                 "staleness_mode": staleness_mode,
                 "zero_delay_nodes": zero_delay_nodes,
                 "aggregated_momentum_l2_norm": 0.0,
+                "delayed_gradient_cosine_mean": None,
+                "delayed_gradient_relative_discrepancy_mean": None,
+                "delayed_gradient_count": 0,
                 "progress_interval_seconds": None,
                 "elapsed_seconds": None,
             }
@@ -313,6 +356,8 @@ def train_distributed(
                     "staleness": 0,
                     "has_delay": False,
                     "gradient_l2_norm": None,
+                    "gradient_cosine_similarity": None,
+                    "gradient_relative_discrepancy": None,
                     "source_model_version": 0,
                     "staleness_mode": staleness_mode,
                     "zero_delay_nodes": zero_delay_nodes,
@@ -348,11 +393,28 @@ def train_distributed(
                         f"requested stale version absent from history at step {step}"
                     )
 
+                fresh_gradients: list[Tensor | None] = [None for _ in parameters]
+                if any(lag > 0 for lag in lags):
+                    model.load_state_dict(current_state)
+                    model.train()
+                    optimizer.zero_grad(set_to_none=True)
+                    fresh_logits = model(train_inputs)
+                    assert isinstance(fresh_logits, Tensor)
+                    fresh_loss = cross_entropy(fresh_logits[:, -1], train_labels)
+                    fresh_loss.backward()
+                    fresh_gradients = [
+                        parameter.grad.detach().clone()
+                        if parameter.grad is not None else None
+                        for parameter in parameters
+                    ]
+                    optimizer.zero_grad(set_to_none=True)
+
                 accumulated_gradients: list[Tensor | None] = [
                     None for _ in parameters
                 ]
                 node_gradient_norms: list[float] = []
-                for source_version in source_versions:
+                node_gradient_alignments: list[tuple[float, float] | None] = []
+                for lag, source_version in zip(lags, source_versions):
                     model.load_state_dict(history_by_version[source_version])
                     model.train()
                     optimizer.zero_grad(set_to_none=True)
@@ -361,6 +423,17 @@ def train_distributed(
                     loss = cross_entropy(logits[:, -1], train_labels)
                     loss.backward()
                     node_gradient_norms.append(_gradient_l2_norm(parameters))
+                    if lag > 0:
+                        stale_gradients = [
+                            parameter.grad.detach().clone()
+                            if parameter.grad is not None else None
+                            for parameter in parameters
+                        ]
+                        node_gradient_alignments.append(
+                            _gradient_alignment(stale_gradients, fresh_gradients)
+                        )
+                    else:
+                        node_gradient_alignments.append(None)
                     for index, parameter in enumerate(parameters):
                         if parameter.grad is not None:
                             gradient = parameter.grad.detach().clone()
@@ -410,6 +483,20 @@ def train_distributed(
                     "zero_delay_nodes": zero_delay_nodes,
                     "aggregated_momentum_l2_norm": aggregated_momentum_l2_norm,
                 }
+                delayed_alignments = [
+                    alignment
+                    for lag, alignment in zip(lags, node_gradient_alignments)
+                    if lag > 0 and alignment is not None
+                ]
+                row["delayed_gradient_cosine_mean"] = (
+                    sum(value[0] for value in delayed_alignments) / len(delayed_alignments)
+                    if delayed_alignments else None
+                )
+                row["delayed_gradient_relative_discrepancy_mean"] = (
+                    sum(value[1] for value in delayed_alignments) / len(delayed_alignments)
+                    if delayed_alignments else None
+                )
+                row["delayed_gradient_count"] = len(delayed_alignments)
                 mechanistic_due = (
                     new_version % int(logging["mechanistic_metrics_interval"]) == 0
                 )
@@ -448,8 +535,13 @@ def train_distributed(
                 model.load_state_dict(new_state)
 
                 node_records = []
-                for node, (lag, source_version, gradient_norm) in enumerate(
-                    zip(lags, source_versions, node_gradient_norms)
+                for node, (lag, source_version, gradient_norm, alignment) in enumerate(
+                    zip(
+                        lags,
+                        source_versions,
+                        node_gradient_norms,
+                        node_gradient_alignments,
+                    )
                 ):
                     node_record: dict[str, Any] = {
                         "step": new_version,
@@ -457,6 +549,12 @@ def train_distributed(
                         "staleness": lag,
                         "has_delay": lag > 0,
                         "gradient_l2_norm": gradient_norm,
+                        "gradient_cosine_similarity": (
+                            alignment[0] if alignment is not None else None
+                        ),
+                        "gradient_relative_discrepancy": (
+                            alignment[1] if alignment is not None else None
+                        ),
                         "source_model_version": source_version,
                         "staleness_mode": staleness_mode,
                         "zero_delay_nodes": zero_delay_nodes,
