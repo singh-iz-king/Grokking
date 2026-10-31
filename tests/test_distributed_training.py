@@ -2,11 +2,13 @@ import json
 
 import torch
 
+import src.distributed_trainer as distributed_trainer
 from src.distributed_trainer import _gradient_alignment, train_distributed
 from src.plotting import plot_node_metrics, plot_results
 from scripts.train_distributed import (
     run_fixed_delay_composition_sweep,
     run_learning_rate_sweep,
+    run_gradient_rejection_sweep,
 )
 from src.trainer import train
 
@@ -355,3 +357,157 @@ def test_fixed_delay_composition_sweep_runs_all_node_assignments(
             checkpoint["distributed_state"]["zero_delay_nodes"]
             == zero_delay_nodes
         )
+
+
+def test_gradient_rejection_freezes_model_and_adamw_state_but_advances_attempt(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    config = _config(tmp_path, epochs=4, mechanistic_interval=4)
+    config["logging"]["checkpoint_interval"] = 1
+    baseline_dir = train_distributed(
+        config,
+        tau=2,
+        nodes=2,
+        staleness_mode="mixed_fixed",
+        zero_delay_nodes=0,
+        run_dir=tmp_path / "baseline",
+    )
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        distributed_trainer,
+        "_gradient_alignment",
+        lambda stale, fresh: (-0.5, 1.5),
+    )
+    rejected_dir = train_distributed(
+        config,
+        tau=2,
+        nodes=2,
+        staleness_mode="mixed_fixed",
+        zero_delay_nodes=0,
+        reject_below_mean_cosine=0.0,
+        run_dir=tmp_path / "rejected",
+    )
+    capsys.readouterr()
+
+    rows = _read_jsonl(rejected_dir / "metrics.jsonl")
+    assert rows[3]["step"] == 3
+    assert rows[3]["update_rejected"] is True
+    assert rows[3]["rejection_reason"] == "delayed_mean_cosine_below_0"
+    assert rows[3]["accepted_updates"] == 2
+    assert rows[3]["rejected_updates"] == 1
+
+    baseline_checkpoint_dir = (
+        tmp_path / "checkpoints" / baseline_dir.name
+    )
+    rejected_checkpoint_dir = (
+        tmp_path / "checkpoints" / rejected_dir.name
+    )
+    baseline_state = torch.load(
+        baseline_checkpoint_dir / "step_0000002.pt",
+        weights_only=False,
+    )
+    rejected_state = torch.load(
+        rejected_checkpoint_dir / "step_0000003.pt",
+        weights_only=False,
+    )
+    for name, value in baseline_state["model_state_dict"].items():
+        assert torch.equal(value, rejected_state["model_state_dict"][name]), name
+    baseline_optimizer = baseline_state["optimizer_state_dict"]["state"]
+    rejected_optimizer = rejected_state["optimizer_state_dict"]["state"]
+    assert baseline_optimizer.keys() == rejected_optimizer.keys()
+    for parameter_id in baseline_optimizer:
+        for moment in ("exp_avg", "exp_avg_sq", "step"):
+            assert torch.equal(
+                baseline_optimizer[parameter_id][moment],
+                rejected_optimizer[parameter_id][moment],
+            )
+    assert (
+        rejected_state["scheduler_state_dict"]["last_epoch"]
+        == baseline_state["scheduler_state_dict"]["last_epoch"] + 1
+    )
+
+    plot_results(rejected_dir)
+    assert (rejected_dir / "figures" / "accuracy.png").is_file()
+    assert (rejected_dir / "figures" / "gradient_alignment.pdf").is_file()
+
+
+def test_staged_schedule_runs_four_exact_post_threshold_phases(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    config = _config(tmp_path, epochs=3, mechanistic_interval=10)
+    monkeypatch.setattr(
+        distributed_trainer,
+        "evaluate_model",
+        lambda *args, **kwargs: {
+            "train_loss": 0.1,
+            "test_loss": 0.1,
+            "train_accuracy": 1.0,
+            "test_accuracy": 1.0,
+        },
+    )
+    run_dir = train_distributed(
+        config,
+        tau=1,
+        nodes=6,
+        staleness_mode="mixed_fixed",
+        zero_delay_nodes=3,
+        staged_delay_schedule=True,
+        staged_phase_steps=1,
+        run_dir=tmp_path / "staged",
+    )
+    capsys.readouterr()
+
+    rows = _read_jsonl(run_dir / "metrics.jsonl")
+    scheduled_rows = [row for row in rows if row["step"] > 0]
+    assert [row["staged_delayed_workers"] for row in scheduled_rows] == [
+        4, 3, 5, 6,
+    ]
+    assert [row["staged_phase_step"] for row in scheduled_rows] == [1, 1, 1, 1]
+    assert [row["delay_phase_transition"] for row in scheduled_rows] == [
+        "initial_test_accuracy_reached_0.99",
+        "scheduled_phase_boundary",
+        "scheduled_phase_boundary",
+        "scheduled_phase_boundary",
+    ]
+    status = json.loads((run_dir / "schedule_status.json").read_text())
+    assert status["status"] == "completed"
+    assert status["completed_steps"] == 4
+    checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
+    assert checkpoint["step"] == 4
+
+
+def test_staged_schedule_stops_at_initial_cap_without_threshold(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    config = _config(tmp_path, epochs=2, mechanistic_interval=10)
+    monkeypatch.setattr(
+        distributed_trainer,
+        "evaluate_model",
+        lambda *args, **kwargs: {
+            "train_loss": 1.0,
+            "test_loss": 1.0,
+            "train_accuracy": 0.5,
+            "test_accuracy": 0.5,
+        },
+    )
+    run_dir = train_distributed(
+        config,
+        tau=1,
+        nodes=6,
+        staleness_mode="mixed_fixed",
+        zero_delay_nodes=3,
+        staged_delay_schedule=True,
+        staged_phase_steps=1,
+        run_dir=tmp_path / "staged_timeout",
+    )
+    capsys.readouterr()
+
+    rows = _read_jsonl(run_dir / "metrics.jsonl")
+    assert [row["step"] for row in rows] == [0, 1, 2]
+    assert [row["staged_delayed_workers"] for row in rows] == [3, 3, 3]
+    status = json.loads((run_dir / "schedule_status.json").read_text())
+    assert status["status"] == "stopped_initial_99_percent_threshold_not_reached"
+    assert status["completed_steps"] == 2
+    checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
+    assert checkpoint["step"] == 2

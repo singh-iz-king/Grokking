@@ -91,6 +91,28 @@ python -m scripts.train_distributed --config configs/modular_addition_p113.yaml 
 
 This runs six separate experiments, from 0 zero-delay nodes / 5 delayed nodes through 5 zero-delay nodes / 0 delayed nodes. The delay, node count, seed, data split, optimizer, and all other settings remain fixed. Each run has a distinct directory tagged with the delay, zero-delay count, and total node count; if `--run-dir` is supplied, it serves as the parent directory. This sweep cannot be combined with `--zero-delay-nodes` or `--step-size-sweep`.
 
+### Reject updates with misaligned stale gradients
+
+The opt-in rejection sweep tests every delayed-worker composition from 0/6 through 6/6 at fixed delay 5, using a default mean-cosine cutoff of `-0.25`:
+
+```bash
+python -m scripts.train_distributed --config configs/modular_addition_p113.yaml \
+  --reject-misaligned-sweep
+```
+
+Set `--nodes`, `--fixed-delay`, and `--mean-cosine-cutoff` to change those defaults. For example, `--nodes 6 --fixed-delay 5 --mean-cosine-cutoff -0.25` is explicit. On an attempted update with delayed workers, if their mean stale-versus-fresh cosine is strictly below the cutoff, the central `optimizer.step()` is skipped: parameters, AdamW first/second moments, and weight decay do not change. The scheduler and global attempt clock still advance, and the attempted step, decision, reason, and cumulative accepted/rejected counts are logged. This is intentionally a whole aggregated-update rejection, not selective worker removal. Accuracy plots and `gradient_alignment.pdf` mark rejected attempts. Each composition is saved to a separate tagged run directory; `--run-dir` can specify their parent. This experiment is independent of the existing fixed-delay sweep and does not change it.
+
+### Change delayed-worker count after grokking
+
+The staged experiment starts with 3/6 delayed workers, waits until the first *measured* test accuracy reaches 99%, then runs 10,000 global attempts at each of 4/6, 3/6, 5/6, and 6/6 delayed workers:
+
+```bash
+python -m scripts.train_distributed --config configs/modular_addition_p113.yaml \
+  --staged-delay-schedule
+```
+
+The initial 3/6 stage is capped at `experiment.epochs` (40,000 in the canonical YAML). If no recorded test evaluation reaches 99% by then, the run stops without entering the later phases and writes that outcome to `schedule_status.json`. Change the post-trigger phase duration with `--phase-steps`; the schedule requires six nodes and fixed delay defaults to 5 (`--fixed-delay` can override it). Metrics record each phase and transition, plots mark transitions, and the final checkpoint is saved at the actual final attempt. Both new experiment modes default to six nodes without changing the existing modes' five-node defaults.
+
 To compare learning rates at a fixed τ, add `--step-size-sweep`:
 
 ```bash

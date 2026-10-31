@@ -144,6 +144,9 @@ def train_distributed(
     run_dir: str | Path | None = None,
     staleness_mode: str = "uniform",
     zero_delay_nodes: int | None = None,
+    reject_below_mean_cosine: float | None = None,
+    staged_delay_schedule: bool = False,
+    staged_phase_steps: int = 10_000,
 ) -> Path:
     """Simulate async centralized gradient aggregation with node-local staleness.
 
@@ -163,6 +166,17 @@ def train_distributed(
             raise ValueError(f"zero_delay_nodes must be between 0 and {nodes}")
     elif zero_delay_nodes is not None:
         raise ValueError("zero_delay_nodes is only valid with mixed_fixed staleness")
+    if reject_below_mean_cosine is not None and not -1.0 <= reject_below_mean_cosine <= 1.0:
+        raise ValueError("reject_below_mean_cosine must be between -1 and 1")
+    if staged_delay_schedule:
+        if staleness_mode != "mixed_fixed":
+            raise ValueError("staged_delay_schedule requires mixed_fixed staleness")
+        if nodes != 6:
+            raise ValueError("the staged delay schedule is defined for exactly 6 nodes")
+        if staged_phase_steps < 1:
+            raise ValueError("staged_phase_steps must be positive")
+        if reject_below_mean_cosine is not None:
+            raise ValueError("staged_delay_schedule cannot be combined with gradient rejection")
 
     seed = int(config["experiment"]["seed"])
     seed_everything(seed)
@@ -195,6 +209,24 @@ def train_distributed(
             "epsilon": GRADIENT_ALIGNMENT_EPSILON,
             "fresh_gradient_computations_per_step": 1,
         },
+        "gradient_rejection": {
+            "enabled": reject_below_mean_cosine is not None,
+            "mean_cosine_threshold": reject_below_mean_cosine,
+            "semantics": (
+                "skip_optimizer_step_freeze_parameters_and_adamw_moments_advance_scheduler"
+                if reject_below_mean_cosine is not None else None
+            ),
+        },
+        "staged_delay_schedule": {
+            "enabled": staged_delay_schedule,
+            "initial_delayed_workers": 3 if staged_delay_schedule else None,
+            "initial_test_accuracy_threshold": 0.99 if staged_delay_schedule else None,
+            "initial_max_steps": (
+                int(config["experiment"]["epochs"]) if staged_delay_schedule else None
+            ),
+            "later_delayed_workers": [4, 3, 5, 6] if staged_delay_schedule else [],
+            "later_phase_steps": staged_phase_steps if staged_delay_schedule else None,
+        },
         "startup": "synchronous_until_tau_history_steps_exist",
         "node_metrics": "selected_gradient_source_model",
     }
@@ -208,6 +240,11 @@ def train_distributed(
         experiment["name"] = (
             f"{experiment['name']}_distributed_async_tau{tau}_nodes{nodes}"
         )
+    if reject_below_mean_cosine is not None:
+        threshold_tag = f"{reject_below_mean_cosine:g}".replace("-", "m").replace(".", "p")
+        experiment["name"] += f"_reject_mean_cos_below_{threshold_tag}"
+    if staged_delay_schedule:
+        experiment["name"] += f"_staged_delay_phases_{staged_phase_steps}"
     effective_config["experiment"] = experiment
 
     if run_dir is not None:
@@ -289,7 +326,16 @@ def train_distributed(
                 flush=True,
             )
 
-    total_steps = int(config["experiment"]["epochs"])
+    configured_steps = int(config["experiment"]["epochs"])
+    total_steps = (
+        configured_steps + 4 * staged_phase_steps
+        if staged_delay_schedule else configured_steps
+    )
+    staged_phase_index = 0
+    staged_phase_attempts = 0
+    staged_phase_delayed_workers = [3, 4, 3, 5, 6]
+    accepted_updates = 0
+    rejected_updates = 0
     logging = config["logging"]
     mech_config = config["mechanistic"]
     key_config = mech_config["key_frequencies"]
@@ -325,11 +371,22 @@ def train_distributed(
                 "distributed_tau": tau,
                 "distributed_nodes": nodes,
                 "staleness_mode": staleness_mode,
-                "zero_delay_nodes": zero_delay_nodes,
+                "zero_delay_nodes": (
+                    nodes - 3 if staged_delay_schedule else zero_delay_nodes
+                ),
                 "aggregated_momentum_l2_norm": 0.0,
                 "delayed_gradient_cosine_mean": None,
                 "delayed_gradient_relative_discrepancy_mean": None,
                 "delayed_gradient_count": 0,
+                "update_rejected": False,
+                "rejection_reason": None,
+                "accepted_updates": 0,
+                "rejected_updates": 0,
+                "mean_cosine_rejection_threshold": reject_below_mean_cosine,
+                "staged_phase": 0 if staged_delay_schedule else None,
+                "staged_delayed_workers": 3 if staged_delay_schedule else None,
+                "staged_phase_step": 0 if staged_delay_schedule else None,
+                "delay_phase_transition": None,
                 "progress_interval_seconds": None,
                 "elapsed_seconds": None,
             }
@@ -360,7 +417,9 @@ def train_distributed(
                     "gradient_relative_discrepancy": None,
                     "source_model_version": 0,
                     "staleness_mode": staleness_mode,
-                    "zero_delay_nodes": zero_delay_nodes,
+                    "zero_delay_nodes": (
+                        nodes - 3 if staged_delay_schedule else zero_delay_nodes
+                    ),
                     **version_basic_metrics[0],
                     "progress_measures": metric_cache.get(0),
                 }
@@ -368,15 +427,56 @@ def train_distributed(
             ])
 
             for step in range(total_steps):
+                transition = None
+                if staged_delay_schedule:
+                    if staged_phase_index == 0:
+                        if version_basic_metrics[step]["test_accuracy"] >= 0.99:
+                            staged_phase_index = 1
+                            staged_phase_attempts = 0
+                            transition = "initial_test_accuracy_reached_0.99"
+                        elif staged_phase_attempts >= configured_steps:
+                            write_json(output_dir / "schedule_status.json", {
+                                "status": "stopped_initial_99_percent_threshold_not_reached",
+                                "completed_steps": step,
+                                "initial_max_steps": configured_steps,
+                                "test_accuracy": version_basic_metrics[step]["test_accuracy"],
+                            })
+                            total_steps = step
+                            break
+                    elif staged_phase_attempts >= staged_phase_steps:
+                        staged_phase_index += 1
+                        staged_phase_attempts = 0
+                        transition = "scheduled_phase_boundary"
+                        if staged_phase_index >= len(staged_phase_delayed_workers):
+                            total_steps = step
+                            write_json(output_dir / "schedule_status.json", {
+                                "status": "completed",
+                                "completed_steps": step,
+                                "phase_delayed_workers": staged_phase_delayed_workers,
+                                "phase_steps": staged_phase_steps,
+                                "initial_test_accuracy_threshold": 0.99,
+                            })
+                            break
+
+                if staged_delay_schedule:
+                    current_delayed_workers = staged_phase_delayed_workers[staged_phase_index]
+                    current_zero_delay_nodes = nodes - current_delayed_workers
+                else:
+                    current_delayed_workers = (
+                        nodes - int(zero_delay_nodes)
+                        if staleness_mode == "mixed_fixed" and zero_delay_nodes is not None
+                        else None
+                    )
+                    current_zero_delay_nodes = zero_delay_nodes
                 global_version = step
                 current_state = _snapshot(model)
                 available_versions = {version for version, _ in history}
                 if tau == 0 or step < tau:
                     lags = [0] * nodes
                 elif staleness_mode == "mixed_fixed":
-                    assert zero_delay_nodes is not None
+                    assert current_zero_delay_nodes is not None
                     lags = [
-                        0 if node < zero_delay_nodes else tau
+                        0 if node < current_zero_delay_nodes else tau
                         for node in range(nodes)
                     ]
                 else:
@@ -447,7 +547,29 @@ def train_distributed(
                 for parameter, gradient in zip(parameters, accumulated_gradients):
                     if gradient is not None:
                         parameter.grad = gradient.div_(nodes)
-                optimizer.step()
+                delayed_alignments = [
+                    alignment
+                    for lag, alignment in zip(lags, node_gradient_alignments)
+                    if lag > 0 and alignment is not None
+                ]
+                mean_cosine = (
+                    sum(value[0] for value in delayed_alignments) / len(delayed_alignments)
+                    if delayed_alignments else None
+                )
+                update_rejected = (
+                    reject_below_mean_cosine is not None
+                    and mean_cosine is not None
+                    and mean_cosine < reject_below_mean_cosine
+                )
+                if update_rejected:
+                    rejected_updates += 1
+                    rejection_reason = (
+                        f"delayed_mean_cosine_below_{reject_below_mean_cosine:g}"
+                    )
+                else:
+                    optimizer.step()
+                    accepted_updates += 1
+                    rejection_reason = None
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 aggregated_momentum_l2_norm = _adam_first_moment_l2_norm(
@@ -480,14 +602,22 @@ def train_distributed(
                     "distributed_tau": tau,
                     "distributed_nodes": nodes,
                     "staleness_mode": staleness_mode,
-                    "zero_delay_nodes": zero_delay_nodes,
+                    "zero_delay_nodes": current_zero_delay_nodes,
                     "aggregated_momentum_l2_norm": aggregated_momentum_l2_norm,
+                    "update_rejected": update_rejected,
+                    "rejection_reason": rejection_reason,
+                    "accepted_updates": accepted_updates,
+                    "rejected_updates": rejected_updates,
+                    "mean_cosine_rejection_threshold": reject_below_mean_cosine,
+                    "staged_phase": staged_phase_index if staged_delay_schedule else None,
+                    "staged_delayed_workers": (
+                        current_delayed_workers if staged_delay_schedule else None
+                    ),
+                    "staged_phase_step": (
+                        staged_phase_attempts + 1 if staged_delay_schedule else None
+                    ),
+                    "delay_phase_transition": transition,
                 }
-                delayed_alignments = [
-                    alignment
-                    for lag, alignment in zip(lags, node_gradient_alignments)
-                    if lag > 0 and alignment is not None
-                ]
                 row["delayed_gradient_cosine_mean"] = (
                     sum(value[0] for value in delayed_alignments) / len(delayed_alignments)
                     if delayed_alignments else None
@@ -555,9 +685,10 @@ def train_distributed(
                         "gradient_relative_discrepancy": (
                             alignment[1] if alignment is not None else None
                         ),
+                        "update_rejected": update_rejected,
                         "source_model_version": source_version,
                         "staleness_mode": staleness_mode,
-                        "zero_delay_nodes": zero_delay_nodes,
+                        "zero_delay_nodes": current_zero_delay_nodes,
                         **version_basic_metrics[source_version],
                     }
                     if mechanistic_due:
@@ -588,6 +719,8 @@ def train_distributed(
                     )
                     last_progress_at = now
                 logger.log(row)
+                if staged_delay_schedule:
+                    staged_phase_attempts += 1
 
                 if new_version % int(logging["checkpoint_interval"]) == 0:
                     _save_distributed_checkpoint(
@@ -602,6 +735,20 @@ def train_distributed(
                         data,
                         staleness_rng,
                     )
+                if (
+                    staged_delay_schedule
+                    and staged_phase_index == len(staged_phase_delayed_workers) - 1
+                    and staged_phase_attempts >= staged_phase_steps
+                ):
+                    total_steps = new_version
+                    write_json(output_dir / "schedule_status.json", {
+                        "status": "completed",
+                        "completed_steps": new_version,
+                        "phase_delayed_workers": staged_phase_delayed_workers,
+                        "phase_steps": staged_phase_steps,
+                        "initial_test_accuracy_threshold": 0.99,
+                    })
+                    break
                 early_stop_threshold = config["training"]["early_stopping_test_loss_below"]
                 if (
                     early_stop_threshold is not None

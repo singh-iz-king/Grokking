@@ -79,6 +79,60 @@ def _plot_series(
     plt.close(fig)
 
 
+def _plot_accuracy_with_training_events(
+    rows: list[dict[str, Any]],
+    figures_dir: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for field in ("train_accuracy", "test_accuracy"):
+        points = [
+            (_row_step(row), float(row[field]))
+            for row in rows
+            if isinstance(row.get(field), (float, int))
+        ]
+        if points:
+            ax.plot(
+                [step for step, _ in points],
+                [accuracy for _, accuracy in points],
+                label=field.replace("_", " "),
+            )
+    rejected_steps = [
+        _row_step(row) for row in rows if row.get("update_rejected") is True
+    ]
+    for index, step in enumerate(rejected_steps):
+        ax.axvline(
+            step,
+            color="#c44e52",
+            alpha=0.25,
+            linewidth=0.7,
+            label="Rejected global update" if index == 0 else None,
+        )
+    transitions = [
+        _row_step(row)
+        for row in rows
+        if row.get("delay_phase_transition")
+    ]
+    for index, step in enumerate(transitions):
+        ax.axvline(
+            step,
+            color="#8172b2",
+            alpha=0.7,
+            linewidth=1.0,
+            linestyle="--",
+            label="Delay-phase transition" if index == 0 else None,
+        )
+    ax.set(
+        title="Training and test accuracy with rejected updates",
+        xlabel="Global optimizer attempt",
+        ylabel="Accuracy",
+    )
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(figures_dir / "accuracy.png", dpi=160)
+    plt.close(fig)
+
+
 def _plot_spectra(run_dir: Path, figures_dir: Path, matrix: str, title: str) -> None:
     path = run_dir / "fourier_spectra.csv"
     if not path.exists():
@@ -187,7 +241,6 @@ def plot_gradient_alignment(
             )
             axes[0].set_ylabel("Cosine similarity")
             axes[0].set_ylim(-1.05, 1.05)
-            axes[0].legend(loc="best")
             axes[0].grid(alpha=0.25)
 
             axes[1].plot(
@@ -200,9 +253,35 @@ def plot_gradient_alignment(
                 label="Mean relative discrepancy over delayed workers",
             )
             axes[1].set_ylabel("Relative discrepancy")
-            axes[1].legend(loc="best")
             axes[1].grid(alpha=0.25)
             for ax in axes:
+                rejected_steps = [
+                    _row_step(row)
+                    for row in rows
+                    if row.get("update_rejected") is True
+                ]
+                for index, step in enumerate(rejected_steps):
+                    ax.axvline(
+                        step,
+                        color="#8172b2",
+                        alpha=0.2,
+                        linewidth=0.55,
+                        label="Rejected global update" if index == 0 else None,
+                    )
+                transitions = [
+                    _row_step(row)
+                    for row in rows
+                    if row.get("delay_phase_transition")
+                ]
+                for index, step in enumerate(transitions):
+                    ax.axvline(
+                        step,
+                        color="#4c9f70",
+                        alpha=0.8,
+                        linestyle="--",
+                        linewidth=0.9,
+                        label="Delay-phase transition" if index == 0 else None,
+                    )
                 for index, (start, end) in enumerate(collapse_intervals):
                     ax.axvspan(
                         start, end,
@@ -210,8 +289,7 @@ def plot_gradient_alignment(
                         alpha=0.15,
                         label="Test accuracy <0.90 episode" if index == 0 else None,
                     )
-                if collapse_intervals:
-                    ax.legend(loc="best")
+                ax.legend(loc="best")
             axes[1].set_xlabel("Global optimizer step")
             fig.suptitle(
                 f"Are stale gradients misdirected?\n{Path(run_id).name}",
@@ -312,6 +390,10 @@ def plot_results(run_dir: str | Path) -> Path:
                  "Cross-entropy loss", figures_dir / "loss.png", log_y=True)
     _plot_series(rows, ["train_accuracy", "test_accuracy"], "Training and test accuracy",
                  "Accuracy", figures_dir / "accuracy.png")
+    if any(row.get("update_rejected") is True for row in rows) or any(
+        row.get("delay_phase_transition") for row in rows
+    ):
+        _plot_accuracy_with_training_events(rows, figures_dir)
     _plot_series(
         rows,
         [
