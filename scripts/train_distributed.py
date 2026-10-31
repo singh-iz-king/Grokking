@@ -247,7 +247,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Run 3/6 delayed until measured test accuracy reaches 0.99, then "
-            "4/6, 3/6, 5/6, and 6/6."
+            "4/6, 3/6, 5/6, 3/6, 6/6, and 3/6."
         ),
     )
     parser.add_argument(

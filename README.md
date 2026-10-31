@@ -104,7 +104,7 @@ Set `--nodes`, `--fixed-delay`, and `--mean-cosine-cutoff` to change those defau
 
 ### Change delayed-worker count after grokking
 
-The staged experiment starts with 3/6 delayed workers, waits until the first *measured* test accuracy reaches 99%, then runs 10,000 global attempts at each of 4/6, 3/6, 5/6, and 6/6 delayed workers:
+The staged experiment starts with 3/6 delayed workers, waits until the first *measured* test accuracy reaches 99%, then runs 10,000 global attempts at each of 4/6, 3/6, 5/6, 3/6, 6/6, and 3/6 delayed workers. The 3/6 phases following 4/6, 5/6, and 6/6 are recovery periods:
 
 ```bash
 python -m scripts.train_distributed --config configs/modular_addition_p113.yaml \

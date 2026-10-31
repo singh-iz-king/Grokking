@@ -432,7 +432,7 @@ def test_gradient_rejection_freezes_model_and_adamw_state_but_advances_attempt(
     assert (rejected_dir / "figures" / "gradient_alignment.pdf").is_file()
 
 
-def test_staged_schedule_runs_four_exact_post_threshold_phases(
+def test_staged_schedule_runs_six_exact_post_threshold_phases(
     tmp_path, capsys, monkeypatch
 ) -> None:
     config = _config(tmp_path, epochs=3, mechanistic_interval=10)
@@ -461,20 +461,24 @@ def test_staged_schedule_runs_four_exact_post_threshold_phases(
     rows = _read_jsonl(run_dir / "metrics.jsonl")
     scheduled_rows = [row for row in rows if row["step"] > 0]
     assert [row["staged_delayed_workers"] for row in scheduled_rows] == [
-        4, 3, 5, 6,
+        4, 3, 5, 3, 6, 3,
     ]
-    assert [row["staged_phase_step"] for row in scheduled_rows] == [1, 1, 1, 1]
+    assert [row["staged_phase_step"] for row in scheduled_rows] == [
+        1, 1, 1, 1, 1, 1,
+    ]
     assert [row["delay_phase_transition"] for row in scheduled_rows] == [
         "initial_test_accuracy_reached_0.99",
+        "scheduled_phase_boundary",
+        "scheduled_phase_boundary",
         "scheduled_phase_boundary",
         "scheduled_phase_boundary",
         "scheduled_phase_boundary",
     ]
     status = json.loads((run_dir / "schedule_status.json").read_text())
     assert status["status"] == "completed"
-    assert status["completed_steps"] == 4
+    assert status["completed_steps"] == 6
     checkpoint = torch.load(run_dir / "final.pt", weights_only=False)
-    assert checkpoint["step"] == 4
+    assert checkpoint["step"] == 6
 
 
 def test_staged_schedule_stops_at_initial_cap_without_threshold(

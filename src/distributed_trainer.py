@@ -224,7 +224,7 @@ def train_distributed(
             "initial_max_steps": (
                 int(config["experiment"]["epochs"]) if staged_delay_schedule else None
             ),
-            "later_delayed_workers": [4, 3, 5, 6] if staged_delay_schedule else [],
+            "later_delayed_workers": [4, 3, 5, 3, 6, 3] if staged_delay_schedule else [],
             "later_phase_steps": staged_phase_steps if staged_delay_schedule else None,
         },
         "startup": "synchronous_until_tau_history_steps_exist",
@@ -328,12 +328,12 @@ def train_distributed(
 
     configured_steps = int(config["experiment"]["epochs"])
     total_steps = (
-        configured_steps + 4 * staged_phase_steps
+        configured_steps + 6 * staged_phase_steps
         if staged_delay_schedule else configured_steps
     )
     staged_phase_index = 0
     staged_phase_attempts = 0
-    staged_phase_delayed_workers = [3, 4, 3, 5, 6]
+    staged_phase_delayed_workers = [3, 4, 3, 5, 3, 6, 3]
     accepted_updates = 0
     rejected_updates = 0
     logging = config["logging"]
