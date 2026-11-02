@@ -69,15 +69,19 @@ def validate_config(config: dict[str, Any]) -> None:
     if threshold is not None and float(threshold) < 0:
         raise ValueError("early_stopping_test_loss_below must be nonnegative or null")
     if not bool(config["optimizer"]["weight_decay_all_parameters"]):
-        raise ValueError("the reference applies AdamW weight decay to all parameters")
-    if config["optimizer"]["name"].lower() != "adamw":
-        raise ValueError("the reference experiment uses AdamW")
+        raise ValueError("the configured optimizer applies weight decay to all parameters")
+    optimizer_name = config["optimizer"]["name"].lower()
+    if optimizer_name not in {"adamw", "sgd"}:
+        raise ValueError("optimizer must be AdamW or SGD")
     if float(config["optimizer"]["learning_rate"]) <= 0:
         raise ValueError("learning_rate must be positive")
     if float(config["optimizer"]["weight_decay"]) < 0:
         raise ValueError("weight_decay must be nonnegative")
-    if float(config["optimizer"]["epsilon"]) <= 0:
+    if optimizer_name == "adamw" and float(config["optimizer"]["epsilon"]) <= 0:
         raise ValueError("AdamW epsilon must be positive")
+    momentum = float(config["optimizer"].get("momentum", 0.0))
+    if optimizer_name == "sgd" and not 0 <= momentum < 1:
+        raise ValueError("SGD momentum must be in [0, 1)")
     if int(config["optimizer"]["warmup_steps"]) < 0:
         raise ValueError("warmup_steps must be nonnegative")
     if config["mechanistic"]["key_frequencies"]["mode"] not in {"discover", "fixed"}:

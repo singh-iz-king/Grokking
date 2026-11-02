@@ -21,6 +21,7 @@ from src.evaluation import cross_entropy, evaluate_model
 from src.logging_utils import RunLogger
 from src.model import NandaOneLayerTransformer
 from src.progress_measures import calculate_progress_measures
+from src.optimizers import build_optimizer, optimizer_momentum_l2_norm
 from src.trainer import _build_model, _print_run_summary
 from src.utils import environment_info, seed_everything, write_json
 
@@ -68,18 +69,6 @@ def _gradient_alignment(
     cosine = dot_product / (stale_norm * fresh_norm + epsilon)
     relative_discrepancy = math.sqrt(difference_squared_norm) / (fresh_norm + epsilon)
     return cosine, relative_discrepancy
-
-
-def _adam_first_moment_l2_norm(
-    optimizer: torch.optim.Optimizer,
-    parameters: list[nn.Parameter],
-) -> float:
-    norms = [
-        float(torch.linalg.vector_norm(optimizer.state[parameter]["exp_avg"]).item())
-        for parameter in parameters
-        if "exp_avg" in optimizer.state[parameter]
-    ]
-    return math.hypot(*norms)
 
 
 def _snapshot(model: nn.Module) -> dict[str, Tensor]:
@@ -202,7 +191,11 @@ def train_distributed(
             else list(range(nodes))
         ),
         "aggregation": "mean_of_full_batch_node_gradients",
-        "optimizer_semantics": "canonical_adamw_applied_once_per_global_step",
+        "optimizer_semantics": (
+            f"central_{config['optimizer']['name'].lower()}_applied_once_per_global_step"
+        ),
+        "optimizer_name": config["optimizer"]["name"],
+        "sgd_momentum": config["optimizer"].get("momentum", 0.0),
         "gradient_alignment": {
             "enabled": True,
             "definition": "per_delayed_node_stale_vs_current_gradient_on_same_full_batch",
@@ -213,7 +206,7 @@ def train_distributed(
             "enabled": reject_below_mean_cosine is not None,
             "mean_cosine_threshold": reject_below_mean_cosine,
             "semantics": (
-                "skip_optimizer_step_freeze_parameters_and_adamw_moments_advance_scheduler"
+                "skip_optimizer_step_freeze_parameters_and_optimizer_state_advance_scheduler"
                 if reject_below_mean_cosine is not None else None
             ),
         },
@@ -286,13 +279,7 @@ def train_distributed(
 
     model = _build_model(config).to(device)
     optimizer_config = config["optimizer"]
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(optimizer_config["learning_rate"]),
-        betas=(float(optimizer_config["beta1"]), float(optimizer_config["beta2"])),
-        eps=float(optimizer_config["epsilon"]),
-        weight_decay=float(optimizer_config["weight_decay"]),
-    )
+    optimizer = build_optimizer(model.parameters(), optimizer_config)
     parameters = list(model.parameters())
     warmup = int(optimizer_config["warmup_steps"])
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -305,7 +292,7 @@ def train_distributed(
     print(
         f"Distributed simulation: {nodes} nodes | tau={tau} | "
         f"staleness mode={staleness_mode} | full-batch gradients | "
-        "mean aggregation | canonical AdamW",
+        f"mean aggregation | {optimizer_config['name']}",
         flush=True,
     )
     if tau > 0:
@@ -572,7 +559,7 @@ def train_distributed(
                     rejection_reason = None
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-                aggregated_momentum_l2_norm = _adam_first_moment_l2_norm(
+                aggregated_momentum_l2_norm = optimizer_momentum_l2_norm(
                     optimizer, parameters
                 )
 

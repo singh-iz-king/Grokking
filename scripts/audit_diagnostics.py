@@ -165,21 +165,29 @@ def _audit_run(run_dir: Path) -> list[dict[str, str]]:
         "Gradient vectors and stale/fresh inner products are absent; existing gradient norms cannot recover alignment. A targeted run with fresh/stale gradient comparisons is required.",
     ))
 
-    first_moment_logged = any(
+    is_adamw = str(optimizer.get("name", "AdamW")).lower() == "adamw"
+    first_moment_logged = is_adamw and any(
         isinstance(row.get("aggregated_momentum_l2_norm"), (int, float))
         for row in metrics
     )
     moment_sources = _present_sources(run_dir, ["final.pt"])
     results.append(add(
         "adam_first_moment",
-        "logged" if first_moment_logged else (
-            "derivable offline" if checkpoint_exists else "requires new computation or run"
-        ),
-        (["metrics.jsonl"] if first_moment_logged else []) + moment_sources,
+        (
+            "logged" if first_moment_logged else (
+                "derivable offline" if checkpoint_exists else "requires new computation or run"
+            )
+        ) if is_adamw else "requires new computation or run",
+        ((["metrics.jsonl"] if first_moment_logged else []) + moment_sources)
+        if is_adamw else [],
         _interval(
             metrics,
             lambda row: isinstance(row.get("aggregated_momentum_l2_norm"), (int, float)),
-        ) if first_moment_logged else ("final checkpoint only" if checkpoint_exists else NA),
+        ) if first_moment_logged else (
+            ("final checkpoint only" if checkpoint_exists else NA) if is_adamw else NA
+        ),
+        "Not applicable: this run uses SGD and has no AdamW exp_avg state."
+        if not is_adamw else
         "The norm of centralized AdamW exp_avg is logged; exact exp_avg tensors are in optimizer_state_dict at the final checkpoint."
         if first_moment_logged and checkpoint_exists else
         "Only the logged scalar norm is present; full per-parameter moment tensors are unavailable."
@@ -191,12 +199,37 @@ def _audit_run(run_dir: Path) -> list[dict[str, str]]:
     second_moment_logged = False
     results.append(add(
         "adam_second_moment",
-        "derivable offline" if checkpoint_exists else "requires new computation or run",
-        ["final.pt"] if checkpoint_exists else [],
-        "final checkpoint only" if checkpoint_exists else NA,
+        (
+            "derivable offline" if checkpoint_exists else "requires new computation or run"
+        ) if is_adamw else "requires new computation or run",
+        ["final.pt"] if checkpoint_exists and is_adamw else [],
+        "final checkpoint only" if checkpoint_exists and is_adamw else NA,
+        "Not applicable: this run uses SGD and has no AdamW exp_avg_sq state."
+        if not is_adamw else
         "AdamW exp_avg_sq tensors are stored in the final optimizer_state_dict, but no scalar or trajectory is logged."
         if checkpoint_exists else "No optimizer checkpoint containing exp_avg_sq was found.",
     ))
+    if not is_adamw:
+        momentum = float(optimizer.get("momentum", 0.0))
+        momentum_buffer_logged = momentum > 0 and any(
+            isinstance(row.get("aggregated_momentum_l2_norm"), (int, float))
+            for row in metrics
+        )
+        results.append(add(
+            "sgd_momentum_buffer",
+            "logged" if momentum_buffer_logged else "requires new computation or run",
+            (
+                (["metrics.jsonl"] if momentum_buffer_logged else []) + moment_sources
+                if momentum_buffer_logged else []
+            ),
+            _interval(
+                metrics,
+                lambda row: isinstance(row.get("aggregated_momentum_l2_norm"), (int, float)),
+            ) if momentum_buffer_logged else NA,
+            "The centralized SGD momentum-buffer norm is logged; exact per-parameter buffers are saved in the final optimizer state."
+            if momentum_buffer_logged else
+            "No SGD momentum buffer is configured for this run.",
+        ))
 
     history_available = False
     if checkpoint_exists and distributed.get("enabled"):

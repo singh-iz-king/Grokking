@@ -108,6 +108,61 @@ def run_fixed_delay_composition_sweep(
     return results
 
 
+def run_optimizer_composition_sweep(
+    config: dict,
+    optimizer_name: str,
+    tau: int = 5,
+    nodes: int = 6,
+    momentum: float = 0.0,
+    run_dir: str | Path | None = None,
+) -> list[tuple[int, Path]]:
+    """Run a full fixed-delay composition sweep with one SGD variant."""
+    if optimizer_name.lower() != "sgd":
+        raise ValueError("optimizer composition sweeps currently support SGD")
+    if not 0 <= momentum < 1:
+        raise ValueError("SGD momentum must be in [0, 1)")
+    optimizer_tag = "sgd" if momentum == 0 else f"sgd_momentum_{momentum:g}".replace(".", "p")
+    results: list[tuple[int, Path]] = []
+    for zero_delay_nodes in range(nodes + 1):
+        run_config = deepcopy(config)
+        run_config["optimizer"].pop("beta1", None)
+        run_config["optimizer"].pop("beta2", None)
+        run_config["optimizer"].pop("epsilon", None)
+        run_config["optimizer"]["name"] = "SGD"
+        run_config["optimizer"]["momentum"] = momentum
+        run_config["experiment"]["name"] = (
+            f"{config['experiment']['name']}_{optimizer_tag}"
+        )
+        tag = (
+            f"{optimizer_tag}_mixed_fixed_tau_{tau}"
+            f"_zero_delay_nodes_{zero_delay_nodes}_nodes_{nodes}"
+        )
+        specific_run_dir = Path(run_dir) / tag if run_dir is not None else None
+        print(
+            f"\nOptimizer composition sweep: optimizer=SGD | momentum={momentum:g} | "
+            f"tau={tau} | nodes={nodes} | zero-delay nodes={zero_delay_nodes} | "
+            f"delayed workers={nodes - zero_delay_nodes}",
+            flush=True,
+        )
+        output_dir = train_distributed(
+            run_config,
+            tau=tau,
+            nodes=nodes,
+            run_dir=specific_run_dir,
+            staleness_mode="mixed_fixed",
+            zero_delay_nodes=zero_delay_nodes,
+        )
+        if config["output"]["save_plots"]:
+            figures = plot_results(output_dir)
+            node_figures = plot_node_metrics(output_dir)
+            print(
+                f"Figures saved to {figures}; per-node figures saved to {node_figures}",
+                flush=True,
+            )
+        results.append((zero_delay_nodes, output_dir))
+    return results
+
+
 def run_gradient_rejection_sweep(
     config: dict,
     tau: int = 5,
@@ -160,7 +215,7 @@ def run_staged_delay_schedule(
     phase_steps: int = 10_000,
     run_dir: str | Path | None = None,
 ) -> Path:
-    """Run the grokking-triggered 3/6 -> 4/6 -> 3/6 -> 5/6 -> 6/6 schedule."""
+    """Run the grokking-triggered 3/6 -> 4/6 -> 3/6 -> 5/6 -> 3/6 -> 6/6 -> 3/6 schedule."""
     if nodes != 6:
         raise ValueError("the staged delay schedule requires exactly 6 nodes")
     output_dir = train_distributed(
@@ -229,6 +284,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--gd-sweep",
+        action="store_true",
+        help="Sweep all fixed-delay compositions using vanilla SGD (no momentum).",
+    )
+    parser.add_argument(
+        "--momentum-sweep",
+        action="store_true",
+        help="Sweep all fixed-delay compositions using SGD with classical momentum 0.9.",
+    )
+    parser.add_argument(
         "--reject-misaligned-sweep",
         action="store_true",
         help=(
@@ -269,7 +334,16 @@ def main() -> None:
     selected_nodes = (
         args.nodes
         if args.nodes is not None
-        else (6 if args.reject_misaligned_sweep or args.staged_delay_schedule else NODE_COUNT)
+        else (
+            6
+            if (
+                args.reject_misaligned_sweep
+                or args.staged_delay_schedule
+                or args.gd_sweep
+                or args.momentum_sweep
+            )
+            else NODE_COUNT
+        )
     )
     if selected_nodes < 1:
         parser.error("--nodes must be a positive integer")
@@ -279,6 +353,38 @@ def main() -> None:
     ))
     if new_experiment_modes > 1:
         parser.error("--reject-misaligned-sweep and --staged-delay-schedule are separate experiments")
+    optimizer_sweep_modes = sum((args.gd_sweep, args.momentum_sweep))
+    if optimizer_sweep_modes > 1:
+        parser.error("--gd-sweep and --momentum-sweep are separate experiments")
+    if optimizer_sweep_modes:
+        if args.reject_misaligned_sweep or args.staged_delay_schedule:
+            parser.error("optimizer sweeps cannot be combined with rejection or staged schedules")
+        if args.tau is not None or args.zero_delay_nodes is not None:
+            parser.error("optimizer sweeps use --fixed-delay, not --tau or --zero-delay-nodes")
+        if args.step_size_sweep or args.fixed_delay_sweep:
+            parser.error("optimizer sweeps cannot be combined with other sweep flags")
+        fixed_delay = 5 if args.fixed_delay is None else args.fixed_delay
+        if fixed_delay < 0:
+            parser.error("--fixed-delay must be nonnegative")
+        config = load_config(args.config)
+        momentum = 0.9 if args.momentum_sweep else 0.0
+        results = run_optimizer_composition_sweep(
+            config,
+            optimizer_name="SGD",
+            tau=fixed_delay,
+            nodes=selected_nodes,
+            momentum=momentum,
+            run_dir=args.run_dir,
+        )
+        label = "SGD with momentum 0.9" if momentum else "vanilla SGD"
+        print(f"\n{label} composition sweep complete:", flush=True)
+        for zero_delay_nodes, output_dir in results:
+            print(
+                f"  zero-delay nodes={zero_delay_nodes} | "
+                f"delayed workers={selected_nodes - zero_delay_nodes} | run={output_dir}",
+                flush=True,
+            )
+        return
     if args.reject_misaligned_sweep:
         if args.tau is not None or args.zero_delay_nodes is not None:
             parser.error("--reject-misaligned-sweep cannot be combined with --tau or --zero-delay-nodes")

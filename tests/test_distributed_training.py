@@ -3,12 +3,15 @@ import json
 import torch
 
 import src.distributed_trainer as distributed_trainer
+import scripts.train_distributed as distributed_script
+from scripts.audit_diagnostics import _audit_run
 from src.distributed_trainer import _gradient_alignment, train_distributed
 from src.plotting import plot_node_metrics, plot_results
 from scripts.train_distributed import (
     run_fixed_delay_composition_sweep,
     run_learning_rate_sweep,
     run_gradient_rejection_sweep,
+    run_optimizer_composition_sweep,
 )
 from src.trainer import train
 
@@ -126,6 +129,89 @@ def test_gradient_alignment_matches_known_vectors() -> None:
     cosine, relative_discrepancy = _gradient_alignment(fresh, fresh)
     assert abs(cosine - 1.0) < 1e-10
     assert relative_discrepancy == 0.0
+
+
+def test_sgd_optimizer_runs_and_logs_momentum_state(tmp_path, capsys) -> None:
+    config = _config(tmp_path, epochs=1, mechanistic_interval=2)
+    config["optimizer"].pop("beta1")
+    config["optimizer"].pop("beta2")
+    config["optimizer"].pop("epsilon")
+    config["optimizer"]["name"] = "SGD"
+    config["optimizer"]["momentum"] = 0.9
+    momentum_dir = train_distributed(
+        config, tau=0, nodes=2, run_dir=tmp_path / "sgd_momentum"
+    )
+    momentum_output = capsys.readouterr().out
+    assert "Optimizer: SGD" in momentum_output
+    momentum_rows = _read_jsonl(momentum_dir / "metrics.jsonl")
+    assert momentum_rows[1]["aggregated_momentum_l2_norm"] > 0
+    momentum_checkpoint = torch.load(momentum_dir / "final.pt", weights_only=False)
+    assert momentum_checkpoint["config"]["optimizer"]["momentum"] == 0.9
+    assert all(
+        "momentum_buffer" in state
+        for state in momentum_checkpoint["optimizer_state_dict"]["state"].values()
+    )
+    diagnostics = {
+        row["diagnostic"]: row for row in _audit_run(momentum_dir)
+    }
+    assert diagnostics["adam_first_moment"]["status"] == "requires new computation or run"
+    assert diagnostics["sgd_momentum_buffer"]["status"] == "logged"
+
+    vanilla_config = _config(tmp_path, epochs=1, mechanistic_interval=2)
+    for key in ("beta1", "beta2", "epsilon"):
+        vanilla_config["optimizer"].pop(key)
+    vanilla_config["optimizer"]["name"] = "SGD"
+    vanilla_config["optimizer"]["momentum"] = 0.0
+    vanilla_dir = train_distributed(
+        vanilla_config, tau=0, nodes=2, run_dir=tmp_path / "sgd_vanilla"
+    )
+    capsys.readouterr()
+    vanilla_rows = _read_jsonl(vanilla_dir / "metrics.jsonl")
+    assert vanilla_rows[1]["aggregated_momentum_l2_norm"] == 0.0
+    vanilla_checkpoint = torch.load(vanilla_dir / "final.pt", weights_only=False)
+    assert all(
+        not state
+        for state in vanilla_checkpoint["optimizer_state_dict"]["state"].values()
+    )
+
+
+def test_optimizer_composition_sweep_covers_all_assignments_without_mutating_config(
+    tmp_path, monkeypatch
+) -> None:
+    config = _config(tmp_path, epochs=1)
+    original_config = __import__("copy").deepcopy(config)
+    captured = []
+
+    def fake_train(run_config, *, tau, nodes, run_dir, staleness_mode, zero_delay_nodes):
+        captured.append((run_config, tau, nodes, run_dir, staleness_mode, zero_delay_nodes))
+        return tmp_path / "fake_output"
+
+    monkeypatch.setattr(distributed_script, "train_distributed", fake_train)
+    results = run_optimizer_composition_sweep(
+        config,
+        optimizer_name="SGD",
+        tau=5,
+        nodes=3,
+        momentum=0.9,
+        run_dir=tmp_path / "momentum_sweep",
+    )
+
+    assert [zero_count for zero_count, _ in results] == [0, 1, 2, 3]
+    assert len(captured) == 4
+    assert len({run_dir for _, _, _, run_dir, _, _ in captured}) == 4
+    for index, (run_config, tau, nodes, run_dir, mode, zero_count) in enumerate(captured):
+        assert tau == 5
+        assert nodes == 3
+        assert mode == "mixed_fixed"
+        assert zero_count == index
+        assert run_config["optimizer"]["name"] == "SGD"
+        assert run_config["optimizer"]["momentum"] == 0.9
+        assert run_config["optimizer"]["learning_rate"] == 0.001
+        assert run_config["optimizer"]["weight_decay"] == 1.0
+        assert run_config["optimizer"]["warmup_steps"] == 2
+        assert "beta1" not in run_config["optimizer"]
+        assert run_dir.parent == tmp_path / "momentum_sweep"
+    assert config == original_config
 
 
 def test_distributed_node_count_configures_metrics_and_checkpoint(tmp_path, capsys) -> None:

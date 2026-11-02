@@ -443,11 +443,25 @@ def plot_results(run_dir: str | Path) -> Path:
     )
     _plot_series(rows, ["weight_l2_norm"], "L2 norm of all trainable weights",
                  "L2 norm", figures_dir / "weight_l2_norm.png")
+    optimizer_name = "AdamW"
+    optimizer_label = "AdamW first-moment exp_avg"
+    config_path = run_dir / "config.yaml"
+    if config_path.is_file():
+        import yaml
+
+        with config_path.open(encoding="utf-8") as handle:
+            optimizer_config = (yaml.safe_load(handle) or {}).get("optimizer", {})
+        optimizer_name = str(optimizer_config.get("name", optimizer_name))
+        if optimizer_name.lower() == "sgd":
+            momentum = float(optimizer_config.get("momentum", 0.0))
+            optimizer_label = (
+                "SGD momentum buffer" if momentum > 0 else "SGD (no momentum)"
+            )
     _plot_series(
         rows,
         ["aggregated_momentum_l2_norm"],
-        "L2 norm of aggregated AdamW first moment",
-        "L2 norm of exp_avg",
+        f"L2 norm of optimizer momentum state ({optimizer_label})",
+        "L2 norm",
         figures_dir / "aggregated_momentum_l2_norm.png",
     )
     if (run_dir / "node_metrics.jsonl").is_file():

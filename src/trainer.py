@@ -17,6 +17,7 @@ from src.device import select_device
 from src.evaluation import cross_entropy, evaluate_model
 from src.logging_utils import RunLogger
 from src.model import NandaOneLayerTransformer
+from src.optimizers import build_optimizer
 from src.progress_measures import calculate_progress_measures
 from src.utils import environment_info, seed_everything, write_json
 
@@ -44,6 +45,23 @@ def _build_model(config: dict[str, Any]) -> NandaOneLayerTransformer:
         context_length=int(config["data"]["input_length"]),
         activation=str(model_config["activation"]).lower(),
     )
+
+
+def _optimizer_summary(config: dict[str, Any]) -> str:
+    details = [
+        f"Optimizer: {config['name']}",
+        f"lr={config['learning_rate']:g}",
+        f"weight_decay={config['weight_decay']:g}",
+    ]
+    if config["name"].lower() == "adamw":
+        details.extend([
+            f"betas=({config['beta1']:g}, {config['beta2']:g})",
+            f"eps={config['epsilon']:g}",
+        ])
+    else:
+        details.append(f"momentum={float(config.get('momentum', 0.0)):g}")
+    details.append(f"warmup={config['warmup_steps']} steps")
+    return " | ".join(details)
 
 
 def _save_checkpoint(
@@ -116,15 +134,7 @@ def _print_run_summary(
                 f"loss={config['training']['loss']} "
                 f"(float64; training includes equals-token logit)"
             ),
-            (
-                f"Optimizer: {optimizer_config['name']} | "
-                f"lr={optimizer_config['learning_rate']:g} | "
-                f"weight_decay={optimizer_config['weight_decay']:g} | "
-                f"betas=({optimizer_config['beta1']:g}, "
-                f"{optimizer_config['beta2']:g}) | "
-                f"eps={optimizer_config['epsilon']:g} | "
-                f"warmup={optimizer_config['warmup_steps']} steps"
-            ),
+            _optimizer_summary(optimizer_config),
             (
                 f"Logging: progress every {logging['progress_interval']} epochs | "
                 f"train/validation every "
@@ -185,13 +195,7 @@ def train(
     )
     model = _build_model(config).to(device)
     optimizer_config = config["optimizer"]
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(optimizer_config["learning_rate"]),
-        betas=(float(optimizer_config["beta1"]), float(optimizer_config["beta2"])),
-        eps=float(optimizer_config["epsilon"]),
-        weight_decay=float(optimizer_config["weight_decay"]),
-    )
+    optimizer = build_optimizer(model.parameters(), optimizer_config)
     warmup = int(optimizer_config["warmup_steps"])
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
