@@ -430,6 +430,14 @@ def train_distributed(
                 "progress_interval_seconds": None,
                 "elapsed_seconds": None,
             }
+            if weight_norm_counterfactual:
+                initial_row.update({
+                    "weight_l2_norm_before_update": None,
+                    "fresh_only_weight_l2_norm_after_update": None,
+                    "fresh_only_weight_l2_norm_delta": None,
+                    "mixed_gradient_weight_l2_norm_after_update": None,
+                    "mixed_gradient_weight_l2_norm_delta": None,
+                })
             if 0 % int(logging["mechanistic_metrics_interval"]) == 0:
                 initial_measures, initial_spectra = calculate_progress_measures(
                     model,

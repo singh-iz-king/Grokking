@@ -1,4 +1,5 @@
 import json
+import csv
 
 import torch
 
@@ -164,6 +165,20 @@ def test_weight_norm_counterfactual_logs_candidate_updates(tmp_path, capsys) -> 
 
     rows = _read_jsonl(run_dir / "metrics.jsonl")
     assert [row["step"] for row in rows] == [0, 1, 2, 3]
+    with (run_dir / "metrics.csv").open(newline="") as handle:
+        csv_rows = list(csv.DictReader(handle))
+    counterfactual_fields = {
+        "weight_l2_norm_before_update",
+        "fresh_only_weight_l2_norm_after_update",
+        "fresh_only_weight_l2_norm_delta",
+        "mixed_gradient_weight_l2_norm_after_update",
+        "mixed_gradient_weight_l2_norm_delta",
+    }
+    assert counterfactual_fields <= set(csv_rows[0])
+    assert csv_rows[0]["fresh_only_weight_l2_norm_after_update"] == ""
+    assert all(
+        csv_rows[1][field] != "" for field in counterfactual_fields
+    )
     for row in rows[1:]:
         assert row["weight_l2_norm_before_update"] > 0
         assert row["fresh_only_weight_l2_norm_after_update"] > 0
