@@ -120,6 +120,16 @@ python -m scripts.train_distributed --config configs/modular_addition_p113.yaml 
 
 Set `--nodes`, `--fixed-delay`, and `--mean-cosine-cutoff` to change those defaults. For example, `--nodes 6 --fixed-delay 5 --mean-cosine-cutoff -0.25` is explicit. On an attempted update with delayed workers, if their mean stale-versus-fresh cosine is strictly below the cutoff, the central `optimizer.step()` is skipped: parameters, AdamW first/second moments, and weight decay do not change. The scheduler and global attempt clock still advance, and the attempted step, decision, reason, and cumulative accepted/rejected counts are logged. This is intentionally a whole aggregated-update rejection, not selective worker removal. Accuracy plots and `gradient_alignment.pdf` mark rejected attempts. Each composition is saved to a separate tagged run directory; `--run-dir` can specify their parent. This experiment is independent of the existing fixed-delay sweep and does not change it.
 
+### Measure one-step weight-norm pressure from stale gradients
+
+Run one fixed-delay experiment with an explicit delayed-worker count and seed:
+
+```bash
+python -m scripts.train_distributed --weight-norm-counterfactual --fixed-delay 5 --delayed-nodes 3 --nodes 6 --seed 17
+```
+
+At every update, the run compares two hypothetical optimizer steps from the same current parameters and optimizer state: one using the fresh full-batch gradient, and one using the actual average of fresh and stale worker gradients. The fresh-only candidate uses a cloned optimizer, so it does not affect training; the mixed-gradient candidate is the actual update. Metrics record the pre-update weight L2 norm, both post-update norms, and each candidate's change in norm. The run stops at the first measured test accuracy of at least 99%, or after 12,000 updates (or the configured epoch limit if lower). The figures include absolute candidate norms and their per-step norm changes. This isolates the immediate, optimizer-aware effect of including stale gradients; it does not compare separate long-running fresh-only and mixed-gradient trajectories. Output settings, seed, stop reason, and completed steps are saved with the run.
+
 ### Change delayed-worker count after grokking
 
 The staged experiment starts with 3/6 delayed workers, waits until the first *measured* test accuracy reaches 99%, then runs 10,000 global attempts at each of 4/6, 3/6, 5/6, 3/6, 6/6, and 3/6 delayed workers. The 3/6 phases following 4/6, 5/6, and 6/6 are recovery periods:
@@ -184,6 +194,22 @@ python -m scripts.create_thesis_figures --results results/ --output results/thes
 ```
 
 The output contains `phase_diagram.pdf` (with the numerical master table appended as a second page and also saved as CSV), `collapse_diagnostics.pdf`, `gradient_alignment.pdf`, `fourier_circuit_dynamics.pdf`, and `oscillation_analysis.pdf`. Missing vector-based alignment and event-time update diagnostics are explicitly marked unavailable rather than inferred from norms; unavailable logit-margin/full-phase panels in Figure 4 explain the missing source data. Figure 5 documents its momentum-peak selection rule and reports event/interval counts and summary statistics. The command reads saved metrics/configuration/Fourier spectra only and does not train or recompute checkpoints.
+
+## Plot event-aligned collapse and recovery cycles
+
+Drop experiment run folders into `results/` (or any nested directory); each run needs `config.yaml` and `metrics.csv` (or legacy `metrics.jsonl`). Generate per-run, seed-balanced configuration, and paginated cross-configuration plots without retraining:
+
+```bash
+python -m scripts.plot_collapse_cycles \
+  --results-dir results/ \
+  --output-dir results/analysis/collapse_cycles/
+```
+
+By default, events begin at a measured crossing below test accuracy 0.99 after step 3,500, qualify only if accuracy falls below 0.90 before its next measured recovery to 0.99, and use an event onset at the first below-0.99 step. Missing observations are not interpolated; the aligned CSV preserves real step coordinates and stores missing samples as blank/NaN. Default plot windows are -220 to +1,100 steps; `--adaptive-window` extends an event through the next observed collapse and, when available, its recovery. Adjust thresholds/windows with `--onset-threshold`, `--severe-threshold`, `--min-step`, `--pre-window`, and `--post-window`.
+
+The tool groups by effective configuration excluding seed and output/runtime paths; the experiment name is retained as a setting identifier. `--grouping optimizer-delay` can instead group by optimizer/delay/model/task settings (still excluding seed and retaining the experiment name). Runs missing usable configuration or seed metadata are listed in `data/skipped_runs.csv` rather than silently combined. Outputs include `data/collapse_events.csv`, `configuration_summary.csv`, `aligned_trajectories.csv` (with per-step event/seed contributor counts), `included_runs.csv`, and skipped-run diagnostics; figures are saved as high-resolution PNG and PDF in `individual_runs/`, `by_configuration/`, and paginated `comparisons/`. Configuration curves first take each seed's median across its events at each relative step, then compute the across-seed median and IQR. Configuration-level event statistics and timing landmarks likewise use one median per seed, while reporting both contributing seed and event counts. Curves use observed relative steps only and break across gaps exceeding `--max-gap-steps` (100 by default); values are not interpolated. `--no-individual`, `--no-by-configuration`, `--no-comparison`, and `--no-overlay-seeds` control plot volume.
+
+The current checked-in/local `results/` directory may contain no experiment runs. In that case the command emits an empty event table and a skip/inclusion report; place run directories with `config.yaml` and `metrics.csv` under `results/` and rerun it.
 
 ## Outputs
 

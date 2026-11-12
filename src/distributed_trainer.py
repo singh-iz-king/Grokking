@@ -6,6 +6,7 @@ import random
 import shutil
 import time
 from collections import deque
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,34 @@ def _gradient_alignment(
     cosine = dot_product / (stale_norm * fresh_norm + epsilon)
     relative_discrepancy = math.sqrt(difference_squared_norm) / (fresh_norm + epsilon)
     return cosine, relative_discrepancy
+
+
+def _parameter_l2_norm(parameters: list[nn.Parameter]) -> float:
+    norms = [
+        float(torch.linalg.vector_norm(parameter.detach()).item())
+        for parameter in parameters
+        if parameter.requires_grad
+    ]
+    return math.hypot(*norms)
+
+
+def _fresh_candidate_weight_l2_norm(
+    optimizer: torch.optim.Optimizer,
+    parameters: list[nn.Parameter],
+    gradients: list[Tensor | None],
+) -> float:
+    candidate_optimizer = deepcopy(optimizer)
+    candidate_parameters = [
+        parameter
+        for group in candidate_optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    if len(candidate_parameters) != len(parameters) or len(gradients) != len(parameters):
+        raise RuntimeError("optimizer parameters do not match model gradients")
+    for candidate, gradient in zip(candidate_parameters, gradients):
+        candidate.grad = gradient.detach().clone() if gradient is not None else None
+    candidate_optimizer.step()
+    return _parameter_l2_norm(candidate_parameters)
 
 
 def _snapshot(model: nn.Module) -> dict[str, Tensor]:
@@ -136,6 +165,7 @@ def train_distributed(
     reject_below_mean_cosine: float | None = None,
     staged_delay_schedule: bool = False,
     staged_phase_steps: int = 10_000,
+    weight_norm_counterfactual: bool = False,
 ) -> Path:
     """Simulate async centralized gradient aggregation with node-local staleness.
 
@@ -166,6 +196,17 @@ def train_distributed(
             raise ValueError("staged_phase_steps must be positive")
         if reject_below_mean_cosine is not None:
             raise ValueError("staged_delay_schedule cannot be combined with gradient rejection")
+    if weight_norm_counterfactual:
+        if staleness_mode != "mixed_fixed" or zero_delay_nodes is None:
+            raise ValueError(
+                "weight_norm_counterfactual requires mixed_fixed staleness"
+            )
+        if zero_delay_nodes >= nodes:
+            raise ValueError("weight_norm_counterfactual requires at least one delayed node")
+        if staged_delay_schedule or reject_below_mean_cosine is not None:
+            raise ValueError(
+                "weight_norm_counterfactual cannot be combined with staged or rejection modes"
+            )
 
     seed = int(config["experiment"]["seed"])
     seed_everything(seed)
@@ -209,6 +250,14 @@ def train_distributed(
                 "skip_optimizer_step_freeze_parameters_and_optimizer_state_advance_scheduler"
                 if reject_below_mean_cosine is not None else None
             ),
+        },
+        "weight_norm_counterfactual": {
+            "enabled": weight_norm_counterfactual,
+            "comparison": "one_step_same_parameters_and_optimizer_state",
+            "fresh_only_gradient": "current_parameters_full_training_batch",
+            "mixed_gradient": "mean_of_current_and_stale_node_gradients",
+            "max_steps": 12_000 if weight_norm_counterfactual else None,
+            "stop_test_accuracy": 0.99 if weight_norm_counterfactual else None,
         },
         "staged_delay_schedule": {
             "enabled": staged_delay_schedule,
@@ -314,10 +363,14 @@ def train_distributed(
             )
 
     configured_steps = int(config["experiment"]["epochs"])
+    counterfactual_step_limit = min(configured_steps, 12_000)
     total_steps = (
         configured_steps + 6 * staged_phase_steps
         if staged_delay_schedule else configured_steps
     )
+    if weight_norm_counterfactual:
+        total_steps = counterfactual_step_limit
+    counterfactual_stop_reason = "step_limit_reached"
     staged_phase_index = 0
     staged_phase_attempts = 0
     staged_phase_delayed_workers = [3, 4, 3, 5, 3, 6, 3]
@@ -414,6 +467,16 @@ def train_distributed(
             ])
 
             for step in range(total_steps):
+                if (
+                    weight_norm_counterfactual
+                    and step == 0
+                    and version_basic_metrics[0]["test_accuracy"] >= 0.99
+                ):
+                    total_steps = 0
+                    counterfactual_stop_reason = (
+                        "test_accuracy_threshold_reached_at_initial_model"
+                    )
+                    break
                 transition = None
                 if staged_delay_schedule:
                     if staged_phase_index == 0:
@@ -501,6 +564,7 @@ def train_distributed(
                 ]
                 node_gradient_norms: list[float] = []
                 node_gradient_alignments: list[tuple[float, float] | None] = []
+                first_fresh_node_gradients: list[Tensor | None] | None = None
                 for lag, source_version in zip(lags, source_versions):
                     model.load_state_dict(history_by_version[source_version])
                     model.train()
@@ -510,6 +574,12 @@ def train_distributed(
                     loss = cross_entropy(logits[:, -1], train_labels)
                     loss.backward()
                     node_gradient_norms.append(_gradient_l2_norm(parameters))
+                    if lag == 0 and first_fresh_node_gradients is None:
+                        first_fresh_node_gradients = [
+                            parameter.grad.detach().clone()
+                            if parameter.grad is not None else None
+                            for parameter in parameters
+                        ]
                     if lag > 0:
                         stale_gradients = [
                             parameter.grad.detach().clone()
@@ -534,6 +604,28 @@ def train_distributed(
                 for parameter, gradient in zip(parameters, accumulated_gradients):
                     if gradient is not None:
                         parameter.grad = gradient.div_(nodes)
+                counterfactual_metrics: dict[str, float] = {}
+                if weight_norm_counterfactual:
+                    fresh_reference_gradients = (
+                        fresh_gradients
+                        if any(gradient is not None for gradient in fresh_gradients)
+                        else first_fresh_node_gradients
+                    )
+                    if fresh_reference_gradients is None:
+                        raise RuntimeError(
+                            "no current-parameter gradients available for counterfactual"
+                        )
+                    weight_norm_before = _parameter_l2_norm(parameters)
+                    fresh_candidate_norm = _fresh_candidate_weight_l2_norm(
+                        optimizer, parameters, fresh_reference_gradients
+                    )
+                    counterfactual_metrics = {
+                        "weight_l2_norm_before_update": weight_norm_before,
+                        "fresh_only_weight_l2_norm_after_update": fresh_candidate_norm,
+                        "fresh_only_weight_l2_norm_delta": (
+                            fresh_candidate_norm - weight_norm_before
+                        ),
+                    }
                 delayed_alignments = [
                     alignment
                     for lag, alignment in zip(lags, node_gradient_alignments)
@@ -557,6 +649,17 @@ def train_distributed(
                     optimizer.step()
                     accepted_updates += 1
                     rejection_reason = None
+                if weight_norm_counterfactual:
+                    mixed_candidate_norm = _parameter_l2_norm(parameters)
+                    weight_norm_before = counterfactual_metrics[
+                        "weight_l2_norm_before_update"
+                    ]
+                    counterfactual_metrics.update({
+                        "mixed_gradient_weight_l2_norm_after_update": mixed_candidate_norm,
+                        "mixed_gradient_weight_l2_norm_delta": (
+                            mixed_candidate_norm - weight_norm_before
+                        ),
+                    })
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 aggregated_momentum_l2_norm = optimizer_momentum_l2_norm(
@@ -604,6 +707,7 @@ def train_distributed(
                         staged_phase_attempts + 1 if staged_delay_schedule else None
                     ),
                     "delay_phase_transition": transition,
+                    **counterfactual_metrics,
                 }
                 row["delayed_gradient_cosine_mean"] = (
                     sum(value[0] for value in delayed_alignments) / len(delayed_alignments)
@@ -723,6 +827,13 @@ def train_distributed(
                         staleness_rng,
                     )
                 if (
+                    weight_norm_counterfactual
+                    and current_metrics["test_accuracy"] >= 0.99
+                ):
+                    total_steps = new_version
+                    counterfactual_stop_reason = "test_accuracy_reached_0.99"
+                    break
+                if (
                     staged_delay_schedule
                     and staged_phase_index == len(staged_phase_delayed_workers) - 1
                     and staged_phase_attempts >= staged_phase_steps
@@ -742,8 +853,18 @@ def train_distributed(
                     and current_metrics["test_loss"] < float(early_stop_threshold)
                 ):
                     total_steps = new_version
+                    if weight_norm_counterfactual:
+                        counterfactual_stop_reason = "configured_test_loss_early_stop"
                     break
 
+        if weight_norm_counterfactual:
+            write_json(output_dir / "weight_norm_counterfactual_status.json", {
+                "status": counterfactual_stop_reason,
+                "completed_steps": total_steps,
+                "step_limit": counterfactual_step_limit,
+                "test_accuracy_threshold": 0.99,
+                "final_test_accuracy": version_basic_metrics[total_steps]["test_accuracy"],
+            })
         _save_distributed_checkpoint(
             checkpoint_dir / "final.pt",
             model,

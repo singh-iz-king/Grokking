@@ -443,6 +443,27 @@ def plot_results(run_dir: str | Path) -> Path:
     )
     _plot_series(rows, ["weight_l2_norm"], "L2 norm of all trainable weights",
                  "L2 norm", figures_dir / "weight_l2_norm.png")
+    _plot_series(
+        rows,
+        [
+            "weight_l2_norm_before_update",
+            "fresh_only_weight_l2_norm_after_update",
+            "mixed_gradient_weight_l2_norm_after_update",
+        ],
+        "One-step counterfactual weight L2 norms",
+        "Weight L2 norm",
+        figures_dir / "weight_norm_counterfactual.png",
+    )
+    _plot_series(
+        rows,
+        [
+            "fresh_only_weight_l2_norm_delta",
+            "mixed_gradient_weight_l2_norm_delta",
+        ],
+        "One-step counterfactual weight-norm changes",
+        "Change in weight L2 norm",
+        figures_dir / "weight_norm_counterfactual_delta.png",
+    )
     optimizer_name = "AdamW"
     optimizer_label = "AdamW first-moment exp_avg"
     config_path = run_dir / "config.yaml"

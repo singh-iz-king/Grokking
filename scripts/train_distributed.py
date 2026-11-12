@@ -260,6 +260,11 @@ def main() -> None:
         help="Number of logical nodes (default: 5 for existing modes, 6 for new experiments).",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        help="Override the YAML seed (supported by --weight-norm-counterfactual).",
+    )
+    parser.add_argument(
         "--fixed-delay",
         type=int,
         help=(
@@ -308,6 +313,19 @@ def main() -> None:
         help="Rejection-sweep cutoff; reject when mean delayed-worker cosine is strictly below this value.",
     )
     parser.add_argument(
+        "--weight-norm-counterfactual",
+        action="store_true",
+        help=(
+            "Compare one-step weight norms from fresh-only and fresh/stale averaged "
+            "gradients; stop at test accuracy 99%% or 12000 steps."
+        ),
+    )
+    parser.add_argument(
+        "--delayed-nodes",
+        type=int,
+        help="Number of fixed-delay workers for --weight-norm-counterfactual.",
+    )
+    parser.add_argument(
         "--staged-delay-schedule",
         action="store_true",
         help=(
@@ -339,6 +357,7 @@ def main() -> None:
             if (
                 args.reject_misaligned_sweep
                 or args.staged_delay_schedule
+                or args.weight_norm_counterfactual
                 or args.gd_sweep
                 or args.momentum_sweep
             )
@@ -350,9 +369,56 @@ def main() -> None:
     new_experiment_modes = sum((
         args.reject_misaligned_sweep,
         args.staged_delay_schedule,
+        args.weight_norm_counterfactual,
     ))
     if new_experiment_modes > 1:
-        parser.error("--reject-misaligned-sweep and --staged-delay-schedule are separate experiments")
+        parser.error("rejection, staged-delay, and weight-norm experiments are separate modes")
+    if args.weight_norm_counterfactual:
+        if args.fixed_delay is None or args.delayed_nodes is None or args.seed is None:
+            parser.error(
+                "--weight-norm-counterfactual requires --fixed-delay, "
+                "--delayed-nodes, and --seed"
+            )
+        if (
+            args.tau is not None
+            or args.zero_delay_nodes is not None
+            or args.fixed_delay_sweep
+            or args.gd_sweep
+            or args.momentum_sweep
+            or args.step_size_sweep
+        ):
+            parser.error(
+                "--weight-norm-counterfactual requires a single fixed-delay run"
+            )
+        if args.fixed_delay < 0:
+            parser.error("--fixed-delay must be nonnegative")
+        if not 1 <= args.delayed_nodes <= selected_nodes:
+            parser.error(f"--delayed-nodes must be between 1 and {selected_nodes}")
+        config = load_config(args.config)
+        config["experiment"]["seed"] = args.seed
+        config["experiment"]["name"] += "_weight_norm_counterfactual"
+        zero_delay_nodes = selected_nodes - args.delayed_nodes
+        run_dir = train_distributed(
+            config,
+            tau=args.fixed_delay,
+            nodes=selected_nodes,
+            run_dir=args.run_dir,
+            staleness_mode="mixed_fixed",
+            zero_delay_nodes=zero_delay_nodes,
+            weight_norm_counterfactual=True,
+        )
+        if config["output"]["save_plots"]:
+            figures = plot_results(run_dir)
+            node_figures = plot_node_metrics(run_dir)
+            print(
+                f"Weight-norm counterfactual run saved to {run_dir}; "
+                f"figures saved to {figures} and per-node figures to {node_figures}"
+            )
+        else:
+            print(f"Weight-norm counterfactual run saved to {run_dir}")
+        return
+    if args.seed is not None:
+        parser.error("--seed is only supported with --weight-norm-counterfactual")
     optimizer_sweep_modes = sum((args.gd_sweep, args.momentum_sweep))
     if optimizer_sweep_modes > 1:
         parser.error("--gd-sweep and --momentum-sweep are separate experiments")

@@ -5,7 +5,11 @@ import torch
 import src.distributed_trainer as distributed_trainer
 import scripts.train_distributed as distributed_script
 from scripts.audit_diagnostics import _audit_run
-from src.distributed_trainer import _gradient_alignment, train_distributed
+from src.distributed_trainer import (
+    _fresh_candidate_weight_l2_norm,
+    _gradient_alignment,
+    train_distributed,
+)
 from src.plotting import plot_node_metrics, plot_results
 from scripts.train_distributed import (
     run_fixed_delay_composition_sweep,
@@ -129,6 +133,99 @@ def test_gradient_alignment_matches_known_vectors() -> None:
     cosine, relative_discrepancy = _gradient_alignment(fresh, fresh)
     assert abs(cosine - 1.0) < 1e-10
     assert relative_discrepancy == 0.0
+
+
+def test_fresh_counterfactual_step_does_not_mutate_actual_optimizer() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    gradient = torch.tensor([1.0, 0.0])
+
+    candidate_norm = _fresh_candidate_weight_l2_norm(
+        optimizer, [parameter], [gradient]
+    )
+
+    assert torch.allclose(parameter, torch.tensor([3.0, 4.0]))
+    assert not optimizer.state
+    assert abs(candidate_norm - (2.9**2 + 4.0**2) ** 0.5) < 1e-6
+
+
+def test_weight_norm_counterfactual_logs_candidate_updates(tmp_path, capsys) -> None:
+    config = _config(tmp_path, epochs=3, mechanistic_interval=1)
+    run_dir = train_distributed(
+        config,
+        tau=1,
+        nodes=2,
+        run_dir=tmp_path / "weight_norm",
+        staleness_mode="mixed_fixed",
+        zero_delay_nodes=1,
+        weight_norm_counterfactual=True,
+    )
+    capsys.readouterr()
+
+    rows = _read_jsonl(run_dir / "metrics.jsonl")
+    assert [row["step"] for row in rows] == [0, 1, 2, 3]
+    for row in rows[1:]:
+        assert row["weight_l2_norm_before_update"] > 0
+        assert row["fresh_only_weight_l2_norm_after_update"] > 0
+        assert row["mixed_gradient_weight_l2_norm_after_update"] > 0
+        assert abs(
+            row["mixed_gradient_weight_l2_norm_after_update"]
+            - row["weight_l2_norm"]
+        ) < 1e-6
+        assert abs(
+            row["fresh_only_weight_l2_norm_delta"]
+            - (
+                row["fresh_only_weight_l2_norm_after_update"]
+                - row["weight_l2_norm_before_update"]
+            )
+        ) < 1e-12
+    status = json.loads(
+        (run_dir / "weight_norm_counterfactual_status.json").read_text()
+    )
+    assert status["completed_steps"] == 3
+    assert status["status"] == "step_limit_reached"
+    plot_results(run_dir)
+    assert (
+        run_dir / "figures" / "weight_norm_counterfactual.png"
+    ).is_file()
+    assert (
+        run_dir / "figures" / "weight_norm_counterfactual_delta.png"
+    ).is_file()
+
+
+def test_weight_norm_counterfactual_stops_at_first_99_percent(tmp_path, monkeypatch, capsys) -> None:
+    config = _config(tmp_path, epochs=5, mechanistic_interval=1)
+    original_evaluate = distributed_trainer.evaluate_model
+    calls = 0
+
+    def reach_threshold_after_one_step(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        metrics = original_evaluate(*args, **kwargs)
+        metrics["test_accuracy"] = 0.5 if calls == 1 else 0.99
+        return metrics
+
+    monkeypatch.setattr(
+        distributed_trainer, "evaluate_model", reach_threshold_after_one_step
+    )
+    run_dir = train_distributed(
+        config,
+        tau=1,
+        nodes=2,
+        run_dir=tmp_path / "weight_norm_early_stop",
+        staleness_mode="mixed_fixed",
+        zero_delay_nodes=1,
+        weight_norm_counterfactual=True,
+    )
+    capsys.readouterr()
+
+    rows = _read_jsonl(run_dir / "metrics.jsonl")
+    assert [row["step"] for row in rows] == [0, 1]
+    status = json.loads(
+        (run_dir / "weight_norm_counterfactual_status.json").read_text()
+    )
+    assert status["completed_steps"] == 1
+    assert status["status"] == "test_accuracy_reached_0.99"
 
 
 def test_sgd_optimizer_runs_and_logs_momentum_state(tmp_path, capsys) -> None:
