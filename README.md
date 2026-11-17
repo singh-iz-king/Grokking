@@ -67,6 +67,18 @@ python -m scripts.train_distributed --config configs/modular_addition_p113.yaml 
 
 The number of global updates comes from `experiment.epochs` in the YAML. Each global step samples one model version per node, computes one full-training-split gradient per node, averages them, and applies one AdamW update to the latest central model. Every node uses the same complete training and test splits; data is not partitioned by node. For `tau > 0`, nodes use the current model synchronously until `tau` update-history steps exist; afterward, each node independently samples a lag uniformly from `1..tau`. The history keeps the current model and its `tau` predecessors.
 
+### Run the primary three-arm staleness-mechanism experiment
+
+Run one paired seed per command; use another `--seed` value for another replicate:
+
+```bash
+python -m scripts.run_primary_experiment --config configs/modular_addition_p113.yaml --seed 17
+```
+
+Defaults are six logical nodes, three delayed nodes (`rho=1/2`), and fixed delay `tau=5`. The command first trains the fresh-gradient AdamW baseline and selects `t0` at the first step with 100 consecutive evaluations at training accuracy `>=99%` and test accuracy `<20%`. Restricted loss is recorded at `t0` but does not affect selection. It branches the same weights, AdamW moments/counters, scheduler, and preceding delay-gradient history into **A**, fresh-gradient AdamW; **B**, delayed mixed-gradient AdamW (mix first, then square); and **C**, the same delayed first-moment input but average fresh/stale gradient squares for AdamW's second moment. Each arm continues to the configured total update limit, normally 40,000. Override composition or delay with `--nodes`, `--delayed-nodes`, or `--tau`; `--selection-streak` changes the consecutive-evaluation count.
+
+Each arm writes `metrics.csv` and `metrics.jsonl`. Full train/test metrics and weight norms are logged every update; fixed paper-frequency and all-addition-frequency restricted/excluded losses are logged every 20 updates by default. Per-step adaptive update norms (total and per parameter tensor) are also recorded. The root output directory contains `checkpoint_t0.pt`, `t0_selection.json`, `persistence_windows.csv` (500-update projected-gradient persistence/energy summaries), `common_path_replay.csv` (A-trajectory shadow comparisons of A/B/C progress and alignment), `arm_outcomes.json` (1,000-update restricted-loss reduction and sustained-99% outcome/right-censoring), and overlay plots for accuracy, losses, weight norm, and adaptive update norms. The sparse restricted-loss mask is the fixed `mechanistic.key_frequencies.paper_mainline` list in the YAML; an all-addition-frequency diagnostic is also reported. Each invocation creates a new run directory and leaves existing experiment modes unchanged.
+
 Use `--tau 0` for the synchronous distributed control: all nodes calculate gradients from the same current model. Their mean is equivalent to one centralized full-batch gradient, up to floating-point summation roundoff. This is a separate run from the canonical one-node command above.
 
 ### Mixed zero-delay and fixed-delay nodes
