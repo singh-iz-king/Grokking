@@ -99,6 +99,16 @@ The command runs no more than 20,000 global updates total (or fewer if the YAML 
 
 To isolate the first-moment intervention, every arm uses the ordinary square of the fresh/stale mixed gradient as the input to AdamW's second moment. This is the same second-moment update rule in all arms; after their parameter paths diverge, the resulting second-moment states need not be numerically identical. Each arm writes per-step metrics, including raw first-/second-moment state norms and adaptive update norms, while Fourier-restricted and excluded losses are logged at the configured diagnostic cadence (20 steps by default). Comparison plots are written under the run's `figures/` folder. `--plot-only <RUN_DIR>` regenerates figures from existing arm metrics without training.
 
+### Compare AdamW second-moment gradient inputs
+
+This complementary experiment keeps the mixed gradient as AdamW's first-moment input in every arm, and varies only the second-moment input:
+
+```bash
+python -m scripts.run_second_moment_experiment --config configs/modular_addition_p113.yaml --seed 0 --nodes 6 --delayed-nodes 4 --tau 4
+```
+
+It uses the same pre-grokking checkpoint rule and defaults to six total nodes, four delayed nodes, and `tau=4`. The four arms feed the second-moment accumulator with the fresh gradient squared, stale gradient squared, square of the mixed gradient, or the weighted average of fresh and stale squares. All arms feed the same mixed gradient to the first moment. The run is capped at 20,000 global updates total (or the YAML limit if lower) and prints progress every 1,000 completed baseline updates and every 1,000 completed post-branch updates. Metrics include both AdamW state norms, train/test accuracy and loss, restricted/excluded losses, and adaptive update norms. Comparison plots and arm outcome summaries are saved with the four arm directories. Use `--plot-only <RUN_DIR>` to regenerate figures without retraining.
+
 Use `--tau 0` for the synchronous distributed control: all nodes calculate gradients from the same current model. Their mean is equivalent to one centralized full-batch gradient, up to floating-point summation roundoff. This is a separate run from the canonical one-node command above.
 
 ### Mixed zero-delay and fixed-delay nodes
