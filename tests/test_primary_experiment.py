@@ -140,5 +140,7 @@ def test_primary_experiment_branches_three_arms_and_writes_diagnostics(tmp_path)
         assert rows[0]["excluded_train_loss_all_addition"] != ""
         assert rows[1]["adaptive_update_l2_norm"] != ""
         assert (output / arm / "final.pt").is_file()
-    assert (output / "test_accuracy.pdf").is_file()
-    assert (output / "restricted_test_loss_paper_keys.png").is_file()
+    assert (output / "figures" / "test_accuracy.pdf").is_file()
+    assert (output / "figures" / "restricted_test_loss_paper_keys.png").is_file()
+    assert (output / "figures" / "persistence_windows.pdf").is_file()
+    assert (output / "figures" / "common_path_replay.pdf").is_file()

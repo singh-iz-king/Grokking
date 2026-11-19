@@ -79,6 +79,26 @@ Defaults are six logical nodes, three delayed nodes (`rho=1/2`), and fixed delay
 
 Each arm writes `metrics.csv` and `metrics.jsonl`. Full train/test metrics and weight norms are logged every update; fixed paper-frequency and all-addition-frequency restricted/excluded losses are logged every 20 updates by default. Per-step adaptive update norms (total and per parameter tensor) are also recorded. The root output directory contains `checkpoint_t0.pt`, `t0_selection.json`, `persistence_windows.csv` (500-update projected-gradient persistence/energy summaries), `common_path_replay.csv` (A-trajectory shadow comparisons of A/B/C progress and alignment), `arm_outcomes.json` (1,000-update restricted-loss reduction and sustained-99% outcome/right-censoring), and overlay plots for accuracy, losses, weight norm, and adaptive update norms. The sparse restricted-loss mask is the fixed `mechanistic.key_frequencies.paper_mainline` list in the YAML; an all-addition-frequency diagnostic is also reported. Each invocation creates a new run directory and leaves existing experiment modes unchanged.
 
+Regenerate the plots from an existing primary run, without retraining:
+
+```bash
+python -m scripts.run_primary_experiment --plot-only results/<primary-run-directory>
+```
+
+The regenerated PNG/PDF comparison figures are placed in that run's `figures/` directory.
+
+### Compare AdamW first-moment gradient inputs
+
+Compare fresh-only, mixed, and delayed-only first-moment inputs from a shared pre-grokking checkpoint:
+
+```bash
+python -m scripts.run_first_moment_experiment --config configs/modular_addition_p113.yaml --seed 0 --nodes 6 --delayed-nodes 4 --tau 4
+```
+
+The command runs no more than 20,000 global updates total (or fewer if the YAML epoch limit is lower), counting the baseline and all treatment arms on the same global step clock. It prints a progress line after each 1,000 completed baseline updates and each 1,000 completed post-branch updates, reporting the arms' test accuracies. The command selects the checkpoint using the same fixed rule as the primary experiment (100 consecutive updates with train accuracy at least 99% and test accuracy below 20%), then branches the weights, AdamW state, scheduler, and preceding gradient history into three arms. The **fresh-only** arm uses the current gradient in AdamW's first moment; **mixed** uses the actual six-node composition mean (two fresh and four fixed-delay gradients); **delayed-only** uses the mean over the four delayed nodes. Since workers use the same full-batch data and same fixed delay, their delayed gradients are identical, so that last mean is the gradient at step `t-4`.
+
+To isolate the first-moment intervention, every arm uses the ordinary square of the fresh/stale mixed gradient as the input to AdamW's second moment. This is the same second-moment update rule in all arms; after their parameter paths diverge, the resulting second-moment states need not be numerically identical. Each arm writes per-step metrics, including raw first-/second-moment state norms and adaptive update norms, while Fourier-restricted and excluded losses are logged at the configured diagnostic cadence (20 steps by default). Comparison plots are written under the run's `figures/` folder. `--plot-only <RUN_DIR>` regenerates figures from existing arm metrics without training.
+
 Use `--tau 0` for the synchronous distributed control: all nodes calculate gradients from the same current model. Their mean is equivalent to one centralized full-batch gradient, up to floating-point summation roundoff. This is a separate run from the canonical one-node command above.
 
 ### Mixed zero-delay and fixed-delay nodes

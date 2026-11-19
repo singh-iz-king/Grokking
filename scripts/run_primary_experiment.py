@@ -320,8 +320,8 @@ def _persistence_summary(
         result[f"persistence_{label}"] = cross_energy / denominator if denominator else math.nan
         result[f"lagged_energy_ratio_{label}"] = stale_energy / current_energy if current_energy else math.nan
         result[f"signed_circuit_alignment_{label}"] = (
-            signed_sum / math.sqrt(q_squared * current_energy)
-            if q_squared and current_energy and not complement else math.nan
+            signed_sum / math.sqrt(len(pairs) * q_squared * current_energy)
+            if pairs and q_squared and current_energy and not complement else math.nan
         )
     return result
 
@@ -398,29 +398,215 @@ def _summary_plots(output_dir: Path, arm_rows: dict[str, list[dict[str, Any]]]) 
         ("test_accuracy", "Test accuracy", "Accuracy"),
         ("train_loss", "Training cross-entropy", "Loss"),
         ("test_loss", "Test cross-entropy", "Loss"),
+        ("restricted_train_loss_paper_keys", "Restricted train loss (paper frequencies)", "Loss"),
         ("restricted_test_loss_paper_keys", "Restricted test loss (paper frequencies)", "Loss"),
         ("excluded_train_loss_paper_keys", "Excluded train loss (paper frequencies)", "Loss"),
+        ("excluded_test_loss_paper_keys", "Excluded test loss (paper frequencies)", "Loss"),
+        ("restricted_train_loss_all_addition", "Restricted train loss (all addition frequencies)", "Loss"),
         ("restricted_test_loss_all_addition", "Restricted test loss (all addition frequencies)", "Loss"),
         ("excluded_train_loss_all_addition", "Excluded train loss (all addition frequencies)", "Loss"),
+        ("excluded_test_loss_all_addition", "Excluded test loss (all addition frequencies)", "Loss"),
         ("adaptive_update_l2_norm", "Adaptive data-update L2 norm", "Update norm"),
         ("relative_adaptive_update_l2_norm", "Relative adaptive update norm", "Update / weight norm"),
         ("weight_l2_norm", "Total parameter L2 norm", "Weight norm"),
     ]
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
     for field, title, ylabel in panels:
         fig, ax = plt.subplots(figsize=(9, 5))
+        plotted = False
         for arm, rows in arm_rows.items():
-            points = [(row["step"], row[field]) for row in rows
-                      if row.get(field) is not None]
+            points = [
+                (row["step"], float(row[field]))
+                for row in rows
+                if row.get(field) not in (None, "")
+                and math.isfinite(float(row[field]))
+            ]
             if points:
-                ax.plot([point[0] for point in points], [point[1] for point in points],
-                        label=labels[arm], color=colors[arm], linewidth=1.2)
+                ax.plot(
+                    [point[0] for point in points],
+                    [point[1] for point in points],
+                    label=labels[arm],
+                    color=colors[arm],
+                    linewidth=1.2,
+                )
+                plotted = True
+        if not plotted:
+            plt.close(fig)
+            continue
         ax.set(title=title, xlabel="Global optimizer updates", ylabel=ylabel)
         ax.grid(True, alpha=0.25)
         ax.legend()
         fig.tight_layout()
+        fig.savefig(figure_dir / f"{field}.png", dpi=180)
+        fig.savefig(figure_dir / f"{field}.pdf")
         fig.savefig(output_dir / f"{field}.png", dpi=180)
         fig.savefig(output_dir / f"{field}.pdf")
         plt.close(fig)
+
+    parameter_blocks = [
+        name.removeprefix("adaptive_update_l2_norm_")
+        for name in arm_rows[next(iter(arm_rows))][0]
+        if name.startswith("adaptive_update_l2_norm_")
+        and name != "adaptive_update_l2_norm"
+    ]
+    if parameter_blocks:
+        fig, axes = plt.subplots(
+            len(parameter_blocks), 1,
+            figsize=(10, max(2.2 * len(parameter_blocks), 7)),
+            sharex=True,
+        )
+        axes = [axes] if len(parameter_blocks) == 1 else list(axes)
+        for ax, block in zip(axes, parameter_blocks):
+            field = f"adaptive_update_l2_norm_{block}"
+            for arm, rows in arm_rows.items():
+                points = [
+                    (row["step"], float(row[field]))
+                    for row in rows
+                    if row.get(field) not in (None, "")
+                    and math.isfinite(float(row[field]))
+                ]
+                if points:
+                    ax.plot(
+                        [point[0] for point in points],
+                        [point[1] for point in points],
+                        label=labels[arm],
+                        color=colors[arm],
+                        linewidth=0.9,
+                    )
+            ax.set_ylabel(block)
+            ax.grid(True, alpha=0.25)
+        axes[0].legend(loc="upper right", fontsize=8)
+        axes[-1].set_xlabel("Global optimizer updates")
+        fig.suptitle("Adaptive update L2 norm by parameter tensor")
+        fig.tight_layout()
+        fig.savefig(figure_dir / "adaptive_update_l2_norm_by_parameter.png", dpi=180)
+        fig.savefig(figure_dir / "adaptive_update_l2_norm_by_parameter.pdf")
+        fig.savefig(output_dir / "adaptive_update_l2_norm_by_parameter.png", dpi=180)
+        fig.savefig(output_dir / "adaptive_update_l2_norm_by_parameter.pdf")
+        plt.close(fig)
+
+
+def _read_arm_metrics(output_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    result: dict[str, list[dict[str, Any]]] = {}
+    for arm in ARM_NAMES:
+        path = output_dir / arm / "metrics.csv"
+        if not path.is_file():
+            raise FileNotFoundError(f"missing metrics for arm {arm}: {path}")
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        converted: list[dict[str, Any]] = []
+        for row in rows:
+            numeric: dict[str, Any] = {}
+            for key, value in row.items():
+                if value is None or value == "":
+                    numeric[key] = None
+                    continue
+                try:
+                    numeric[key] = float(value)
+                except ValueError:
+                    numeric[key] = value
+            if numeric.get("step") is not None:
+                numeric["step"] = int(numeric["step"])
+            converted.append(numeric)
+        if not converted:
+            raise ValueError(f"metrics file is empty: {path}")
+        result[arm] = converted
+    return result
+
+
+def _diagnostic_plots(output_dir: Path) -> None:
+    figure_dir = output_dir / "figures"
+    colors = {"A_fresh_adamw": "#2878b5", "B_delayed_adamw": "#e1812c",
+              "C_no_second_moment_cancellation": "#3a923a"}
+    labels = {
+        "A_fresh_adamw": "A: Fresh AdamW",
+        "B_delayed_adamw": "B: Delayed AdamW",
+        "C_no_second_moment_cancellation": "C: No second-moment cancellation",
+    }
+    sources = (
+        (
+            "persistence_windows.csv",
+            [
+                ("persistence_circuit", "Circuit gradient persistence"),
+                ("persistence_remaining", "Remaining gradient persistence"),
+                ("lagged_energy_ratio_circuit", "Circuit lag/current energy"),
+                ("lagged_energy_ratio_remaining", "Remaining lag/current energy"),
+            ],
+        ),
+        (
+            "common_path_replay.csv",
+            [
+                ("circuit_progress", "Common-path restricted-loss progress"),
+                ("circuit_alignment", "Common-path circuit alignment"),
+                ("adaptive_direction_norm", "Common-path adaptive direction norm"),
+            ],
+        ),
+    )
+    for filename, metrics in sources:
+        path = output_dir / filename
+        if not path.is_file():
+            continue
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        if not rows:
+            continue
+        fig, axes = plt.subplots(
+            len(metrics), 1, figsize=(10, 2.8 * len(metrics)), sharex=True
+        )
+        axes = [axes] if len(metrics) == 1 else list(axes)
+        for ax, (field, ylabel) in zip(axes, metrics):
+            for arm in ARM_NAMES:
+                points: list[tuple[int, float]] = []
+                for row in rows:
+                    row_arm = row.get("arm")
+                    expected_arm = {
+                        "A_fresh_adamw": "A",
+                        "B_delayed_adamw": "B",
+                        "C_no_second_moment_cancellation": "C",
+                    }.get(arm, arm)
+                    if row_arm not in (arm, expected_arm):
+                        continue
+                    try:
+                        x, y = int(row["window_end_step"]), float(row[field])
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if math.isfinite(y):
+                        points.append((x, y))
+                if points:
+                    ax.plot(
+                        [point[0] for point in points],
+                        [point[1] for point in points],
+                        marker="o",
+                        markersize=2.5,
+                        color=colors[arm],
+                        label=labels[arm],
+                    )
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.25)
+        axes[0].legend(loc="best", fontsize=8)
+        axes[-1].set_xlabel("Window end step")
+        fig.suptitle(filename.removesuffix(".csv").replace("_", " ").title())
+        fig.tight_layout(rect=(0.12, 0.02, 0.98, 0.96))
+        fig.savefig(figure_dir / f"{filename.removesuffix('.csv')}.png", dpi=180)
+        fig.savefig(figure_dir / f"{filename.removesuffix('.csv')}.pdf")
+        fig.savefig(output_dir / f"{filename.removesuffix('.csv')}.png", dpi=180)
+        fig.savefig(output_dir / f"{filename.removesuffix('.csv')}.pdf")
+        plt.close(fig)
+
+
+def plot_primary_experiment(output_dir: str | Path) -> Path:
+    """Regenerate primary-experiment figures from saved CSV data only."""
+    run_path = Path(output_dir)
+    if not (run_path / "config.yaml").is_file():
+        raise FileNotFoundError(f"not a primary experiment output directory: {run_path}")
+    arm_rows = _read_arm_metrics(run_path)
+    _summary_plots(run_path, arm_rows)
+    _diagnostic_plots(run_path)
+    branch_step = int(json.loads((run_path / "t0_selection.json").read_text())["step"])
+    final_step = min(int(rows[-1]["step"]) for rows in arm_rows.values())
+    write_json(run_path / "arm_outcomes.json", _arm_outcomes(arm_rows, branch_step, final_step))
+    return run_path / "figures"
 
 
 def _arm_outcomes(
@@ -752,6 +938,7 @@ def run_primary_experiment(
             arm_schedulers[arm].step()
             arm_optimizer.zero_grad(set_to_none=True)
             arm_loggers[arm].log(rows_this_step[arm])
+            arm_rows[arm].append(rows_this_step[arm])
             arm_histories[arm].append(copy.deepcopy(fresh))
             window_pairs[arm].append((fresh, stale))
 
@@ -806,6 +993,7 @@ def run_primary_experiment(
     outcomes = _arm_outcomes(arm_rows, branch_step, final_step)
     write_json(output_dir / "arm_outcomes.json", outcomes)
     _summary_plots(output_dir, arm_rows)
+    _diagnostic_plots(output_dir)
     write_json(output_dir / "primary_experiment_status.json", {
         "status": "completed",
         "branch_step": branch_step,
@@ -821,7 +1009,7 @@ def main() -> None:
         description="Run the paired three-arm primary staleness-mechanism experiment."
     )
     parser.add_argument("--config", default="configs/modular_addition_p113.yaml")
-    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--nodes", type=int, default=6)
     parser.add_argument("--delayed-nodes", type=int, default=3)
     parser.add_argument("--tau", type=int, default=5)
@@ -829,7 +1017,18 @@ def main() -> None:
     parser.add_argument("--selection-streak", type=int, default=100)
     parser.add_argument("--diagnostic-interval", type=int, default=20)
     parser.add_argument("--window-steps", type=int, default=500)
+    parser.add_argument(
+        "--plot-only",
+        metavar="RUN_DIR",
+        help="Regenerate all primary experiment plots from an existing run without training.",
+    )
     args = parser.parse_args()
+    if args.plot_only:
+        figure_dir = plot_primary_experiment(args.plot_only)
+        print(f"Primary experiment figures saved to {figure_dir}", flush=True)
+        return
+    if args.seed is None:
+        parser.error("--seed is required unless --plot-only is used")
     config = load_config(args.config)
     output_dir = run_primary_experiment(
         config,
