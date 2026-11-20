@@ -109,6 +109,16 @@ python -m scripts.run_second_moment_experiment --config configs/modular_addition
 
 It uses the same pre-grokking checkpoint rule and defaults to six total nodes, four delayed nodes, and `tau=4`. The four arms feed the second-moment accumulator with the fresh gradient squared, stale gradient squared, square of the mixed gradient, or the weighted average of fresh and stale squares. All arms feed the same mixed gradient to the first moment. The run is capped at 20,000 global updates total (or the YAML limit if lower) and prints progress every 1,000 completed baseline updates and every 1,000 completed post-branch updates. Metrics include both AdamW state norms, train/test accuracy and loss, restricted/excluded losses, and adaptive update norms. Comparison plots and arm outcome summaries are saved with the four arm directories. Use `--plot-only <RUN_DIR>` to regenerate figures without retraining.
 
+### Compare gradient inputs without first-moment EMA
+
+This experiment sets AdamW `beta1=0`, so the first moment is overwritten by the current arm's selected gradient input on each update. It compares fresh, mixed, and fully stale inputs while using the same mixed-gradient-square rule for the second moment:
+
+```bash
+python -m scripts.run_beta1_zero_experiment --config configs/modular_addition_p113.yaml --seed 0 --nodes 6 --delayed-nodes 4 --tau 4
+```
+
+The shared pre-grokking checkpoint uses the usual 100 consecutive updates with train accuracy at least 99% and test accuracy below 20%. The experiment is capped at 20,000 total updates (or the YAML limit if lower) and prints after every 1,000 completed baseline and post-branch updates. The delayed-only arm uses the full-batch stale gradient at `t-tau`; under fixed delay and identical data, that equals the mean delayed-worker gradient. As in other branched comparisons, the second-moment *rule* is held constant, but its values can diverge after arm trajectories do. Per-arm metrics and comparison plots are written under the output directory; `--plot-only <RUN_DIR>` regenerates figures from the saved CSVs.
+
 Use `--tau 0` for the synchronous distributed control: all nodes calculate gradients from the same current model. Their mean is equivalent to one centralized full-batch gradient, up to floating-point summation roundoff. This is a separate run from the canonical one-node command above.
 
 ### Mixed zero-delay and fixed-delay nodes
